@@ -1,0 +1,43 @@
+# One-command local cluster: three isolated nodes on a private network.
+#   docker compose up --build
+# Node APIs are on http://localhost:3001..3003. Try:
+#   curl -s localhost:3002/reward -H 'content-type: application/json' \
+#        -d '{"amount":100,"memo":"first contribution"}'
+#   curl -s localhost:3001/balances   # same answer from any node
+services:
+  node1:
+    build: .
+    command: ["run", "--data-dir", "/data", "--port", "9000", "--api", "0.0.0.0:3000"]
+    ports:
+      - "3001:3000"
+    volumes:
+      - node1-data:/data
+
+  node2:
+    build: .
+    command:
+      ["run", "--data-dir", "/data", "--port", "9000", "--api", "0.0.0.0:3000",
+       "--bootstrap", "/dns4/node1/tcp/9000"]
+    ports:
+      - "3002:3000"
+    volumes:
+      - node2-data:/data
+    depends_on:
+      - node1
+
+  node3:
+    build: .
+    command:
+      ["run", "--data-dir", "/data", "--port", "9000", "--api", "0.0.0.0:3000",
+       "--bootstrap", "/dns4/node1/tcp/9000"]
+    ports:
+      - "3003:3000"
+    volumes:
+      - node3-data:/data
+    depends_on:
+      - node1
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:
