@@ -59,7 +59,14 @@ async fn status(State(s): State<AppState>) -> Json<Value> {
             .map(|addrs| {
                 addrs
                     .into_iter()
-                    .map(|a| format!("{a}/p2p/{}", s.peer_id))
+                    .map(|a| {
+                        let suffix = format!("/p2p/{}", s.peer_id);
+                        if a.to_string().ends_with(&suffix) {
+                            a.to_string()
+                        } else {
+                            format!("{a}{suffix}")
+                        }
+                    })
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default()

@@ -38,6 +38,13 @@ enum CliCommand {
         /// Multiaddr of a relay to reserve a slot on (for NATed nodes).
         #[arg(long)]
         relay: Option<Multiaddr>,
+        /// Address this node is publicly reachable at (for relays/servers,
+        /// e.g. /ip4/203.0.113.7/tcp/9000). Otherwise AutoNAT discovers it.
+        #[arg(long)]
+        external_address: Vec<Multiaddr>,
+        /// Disable local-network mDNS discovery.
+        #[arg(long)]
+        no_mdns: bool,
     },
     /// Show a running node's status (peers, DAG tips, balance).
     Status {
@@ -83,8 +90,8 @@ async fn main() -> Result<()> {
         .init();
 
     match Cli::parse().command {
-        CliCommand::Run { data_dir, port, api, bootstrap, relay } => {
-            run(data_dir, port, api, bootstrap, relay).await
+        CliCommand::Run { data_dir, port, api, bootstrap, relay, external_address, no_mdns } => {
+            run(data_dir, port, api, bootstrap, relay, external_address, no_mdns).await
         }
         CliCommand::Status { api } => print_json(&get(&api, "/status")?),
         CliCommand::Balances { api } => print_json(&get(&api, "/balances")?),
@@ -107,6 +114,8 @@ async fn run(
     api_addr: String,
     bootstrap: Vec<Multiaddr>,
     relay: Option<Multiaddr>,
+    external_addresses: Vec<Multiaddr>,
+    no_mdns: bool,
 ) -> Result<()> {
     let keypair = identity::load_or_generate(&data_dir)?;
     let peer_id = keypair.public().to_peer_id();
@@ -118,9 +127,13 @@ async fn run(
     let peers = Arc::new(Mutex::new(HashSet::new()));
     let (command_tx, command_rx) = mpsc::channel(64);
 
-    let mut net = network::Network::new(&keypair, dag.clone(), peers.clone(), command_rx)?;
+    let mut net =
+        network::Network::new(&keypair, dag.clone(), peers.clone(), command_rx, !no_mdns)?;
     net.listen(port)?;
-    net.bootstrap(&bootstrap, relay.as_ref());
+    for addr in external_addresses {
+        net.swarm.add_external_address(addr);
+    }
+    net.bootstrap(&bootstrap, relay.as_ref())?;
     let network_task = tokio::spawn(net.run());
 
     let state = api::AppState {

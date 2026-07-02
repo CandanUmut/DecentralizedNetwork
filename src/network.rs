@@ -44,7 +44,7 @@ pub enum SyncResponse {
 #[derive(NetworkBehaviour)]
 pub struct Behaviour {
     gossipsub: gossipsub::Behaviour,
-    mdns: mdns::tokio::Behaviour,
+    mdns: libp2p::swarm::behaviour::toggle::Toggle<mdns::tokio::Behaviour>,
     identify: identify::Behaviour,
     ping: ping::Behaviour,
     autonat: autonat::Behaviour,
@@ -69,6 +69,9 @@ pub struct Network {
     pub peers: Arc<Mutex<HashSet<PeerId>>>,
     commands: mpsc::Receiver<Command>,
     topic: gossipsub::IdentTopic,
+    /// Relay to reserve a slot on once we're connected to it.
+    relay: Option<(PeerId, Multiaddr)>,
+    relay_reserved: bool,
 }
 
 impl Network {
@@ -77,6 +80,7 @@ impl Network {
         dag: Arc<Mutex<Dag>>,
         peers: Arc<Mutex<HashSet<PeerId>>>,
         commands: mpsc::Receiver<Command>,
+        enable_mdns: bool,
     ) -> Result<Self> {
         let swarm = libp2p::SwarmBuilder::with_existing_identity(keypair.clone())
             .with_tokio()
@@ -104,8 +108,15 @@ impl Network {
                 )
                 .map_err(|e| anyhow!("gossipsub: {e}"))?;
 
-                let mdns =
-                    mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id)?;
+                let mdns = if enable_mdns {
+                    Some(mdns::tokio::Behaviour::new(
+                        mdns::Config::default(),
+                        local_peer_id,
+                    )?)
+                } else {
+                    None
+                }
+                .into();
 
                 let identify = identify::Behaviour::new(identify::Config::new(
                     "/timecoin/1.0.0".to_string(),
@@ -143,6 +154,8 @@ impl Network {
             peers,
             commands,
             topic: topic.clone(),
+            relay: None,
+            relay_reserved: false,
         };
         network
             .swarm
@@ -161,23 +174,50 @@ impl Network {
         Ok(())
     }
 
-    /// Dial bootstrap peers and, if a relay is given, reserve a slot on it so
-    /// NATed peers stay reachable via `<relay>/p2p-circuit/p2p/<us>`.
-    pub fn bootstrap(&mut self, bootstrap: &[Multiaddr], relay: Option<&Multiaddr>) {
-        for addr in bootstrap {
+    /// Dial bootstrap peers and, if a relay is given, dial it too. The circuit
+    /// reservation is requested once the relay connection is established (a
+    /// concurrent listen-and-dial to the same peer aborts the reservation).
+    pub fn bootstrap(&mut self, bootstrap: &[Multiaddr], relay: Option<&Multiaddr>) -> Result<()> {
+        if let Some(relay_addr) = relay {
+            let peer_id = relay_addr
+                .iter()
+                .find_map(|p| match p {
+                    libp2p::multiaddr::Protocol::P2p(peer) => Some(peer),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    anyhow!("--relay address must end in /p2p/<relay-peer-id>: {relay_addr}")
+                })?;
+            self.relay = Some((peer_id, relay_addr.clone()));
+        }
+        for addr in bootstrap.iter().chain(relay) {
             match self.swarm.dial(addr.clone()) {
-                Ok(()) => info!("dialing bootstrap peer {addr}"),
-                Err(e) => warn!("failed to dial bootstrap peer {addr}: {e}"),
+                Ok(()) => info!("dialing peer {addr}"),
+                Err(e) => warn!("failed to dial {addr}: {e}"),
             }
         }
-        if let Some(relay_addr) = relay {
-            let circuit = relay_addr
-                .clone()
-                .with(libp2p::multiaddr::Protocol::P2pCircuit);
-            match self.swarm.listen_on(circuit.clone()) {
-                Ok(_) => info!("requesting relay reservation via {relay_addr}"),
-                Err(e) => warn!("failed to listen via relay {relay_addr}: {e}"),
+        Ok(())
+    }
+
+    /// Once connected to the configured relay, ask it for a reservation so we
+    /// stay reachable at `<relay>/p2p-circuit/p2p/<us>`.
+    fn maybe_reserve_relay(&mut self, connected_peer: PeerId) {
+        if self.relay_reserved {
+            return;
+        }
+        let Some((relay_peer, relay_addr)) = &self.relay else { return };
+        if *relay_peer != connected_peer {
+            return;
+        }
+        let circuit = relay_addr
+            .clone()
+            .with(libp2p::multiaddr::Protocol::P2pCircuit);
+        match self.swarm.listen_on(circuit) {
+            Ok(_) => {
+                info!("requesting relay reservation via {relay_addr}");
+                self.relay_reserved = true;
             }
+            Err(e) => warn!("failed to listen via relay {relay_addr}: {e}"),
         }
     }
 
@@ -287,6 +327,7 @@ impl Network {
             SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                 info!("connected to {peer_id} via {}", endpoint.get_remote_address());
                 self.peers.lock().unwrap().insert(peer_id);
+                self.maybe_reserve_relay(peer_id);
                 self.swarm
                     .behaviour_mut()
                     .gossipsub

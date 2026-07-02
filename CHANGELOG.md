@@ -42,6 +42,12 @@
 **Phase 3 — multi-node reproducibility**
 - `docker-compose.yml`: one-command 3-node cluster (`docker compose up`);
   verified converging DAG and identical balances across containers.
+- Relay fallback made to actually work and proven by `scripts/relay-demo.sh`
+  (with mDNS disabled, so the circuit is the only path): reservation is
+  requested only after the relay connection is up (a concurrent dial aborted
+  it), and relays announce their address via the new `--external-address`
+  flag (without a confirmed external address, reservations carry no
+  addresses — `NoAddressesInReservation`). Added `--no-mdns`.
 - README section for joining across real machines, with honest NAT notes.
 
 **Verified demo** (3 local nodes + 1 late joiner): contribution rewarded on
