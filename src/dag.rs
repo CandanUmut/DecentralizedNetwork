@@ -65,6 +65,7 @@ impl Transaction {
     /// length prefixes, and sorted parents make this deterministic across
     /// nodes — the legacy code hashed `format!("{:?}", HashSet)`, whose
     /// iteration order is random per process.
+    #[allow(clippy::too_many_arguments)] // one arg per hashed field, by design
     fn signing_bytes(
         kind: TxKind,
         sender: &str,
