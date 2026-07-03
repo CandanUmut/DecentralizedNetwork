@@ -1,8 +1,9 @@
 # One-command local cluster: three isolated nodes on a private network.
 #   docker compose up --build
-# Node APIs are on http://localhost:3001..3003. Try:
+# Node APIs (and dashboards) are on http://localhost:3001..3003. Try:
+#   P3=$(curl -s localhost:3003/status | jq -r .peer_id)
 #   curl -s localhost:3002/reward -H 'content-type: application/json' \
-#        -d '{"amount":100,"memo":"first contribution"}'
+#        -d "{\"to\":\"$P3\",\"amount\":100,\"memo\":\"first contribution\"}"
 #   curl -s localhost:3001/balances   # same answer from any node
 services:
   node1:

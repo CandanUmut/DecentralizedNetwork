@@ -1,4 +1,10 @@
-# SCOPE — what this build is, and what it is not
+# SCOPE — what the revival MVP was, and what it was not
+
+> **Historical note:** this documents the scope of the initial revival (v0.1.0).
+> Several deferrals below have since shipped in v0.2.0 — attested minting,
+> network-wide overdraft immunity, deterministic double-spend resolution, paid
+> blob storage, and direct messaging. See ROADMAP.md for the current state and
+> CHANGELOG.md for what changed.
 
 This MVP exists to prove one thing end to end: **N nodes on current upstream libp2p
 discover each other, gossip signed TimeCoin contribution records into a shared DAG, and

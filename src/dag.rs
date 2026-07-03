@@ -1,10 +1,15 @@
 //! The TimeCoin DAG ("tangle"): contribution records attach to current tips,
 //! are validated, and balances are derived by folding over the whole DAG.
 //!
-//! Ported from `legacy/timecoin/` with the design kept and the bugs fixed:
-//! deterministic hashing (sorted parents, canonical byte encoding), Ed25519
-//! signatures with the node's persistent key instead of throwaway RSA keys,
-//! and balances computed from the DAG instead of mutating address strings.
+//! v2 ledger rules (see ROADMAP.md, Stage 1):
+//! - Rewards are *attestations*: the signer vouches that someone else provided
+//!   value. A reward whose signer is its own recipient is invalid — you cannot
+//!   mint to yourself. The minter's wallet is recorded, so every coin's origin
+//!   is attributable.
+//! - Transfers carry a per-sender sequence number. Balances are a
+//!   deterministic fold over the transaction *set* (see [`Dag::ledger`]), so
+//!   double-spends resolve identically on every node and network-wide
+//!   balances can never go negative, even against modified clients.
 
 use anyhow::{anyhow, bail, Context, Result};
 use libp2p::identity::{Keypair, PublicKey};
@@ -13,6 +18,10 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+
+/// Cap on structurally-valid transactions parked while their parents are
+/// missing, so a malicious peer can't exhaust memory with orphans.
+const MAX_ORPHANS: usize = 10_000;
 
 /// Derive a wallet address from a peer id, exactly as the legacy code did:
 /// `0x` + hex(sha256(base58 peer id)).
@@ -23,10 +32,12 @@ pub fn wallet_address(peer_id: &libp2p::PeerId) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TxKind {
-    /// Mints `amount` to `receiver` for a contribution. `sender` is the
-    /// wallet of the node that recorded the contribution.
+    /// Mints `amount` to `receiver`, signed by an attester (`sender`) who
+    /// vouches the receiver contributed. Signer's wallet must differ from
+    /// `receiver`.
     Reward,
-    /// Moves `amount` from `sender` to `receiver`.
+    /// Moves `amount` from `sender` to `receiver`. `seq` is the sender's
+    /// transfer sequence number (0, 1, 2, …).
     Transfer,
 }
 
@@ -37,6 +48,9 @@ pub struct Transaction {
     pub sender: String,
     pub receiver: String,
     pub amount: u64,
+    /// Per-sender transfer sequence number; 0 for rewards.
+    #[serde(default)]
+    pub seq: u64,
     /// Free-text description of the contribution (for rewards).
     pub memo: String,
     /// Parent transaction ids, sorted — attachment points in the DAG.
@@ -60,51 +74,73 @@ mod hex_bytes {
     }
 }
 
-impl Transaction {
+/// Everything covered by the transaction hash/signature, in canonical order.
+struct SigningFields<'a> {
+    kind: TxKind,
+    sender: &'a str,
+    receiver: &'a str,
+    amount: u64,
+    seq: u64,
+    memo: &'a str,
+    parents: &'a [String],
+    timestamp: u64,
+    public_key: &'a [u8],
+}
+
+impl SigningFields<'_> {
     /// Canonical bytes covered by the hash and the signature. Field order,
     /// length prefixes, and sorted parents make this deterministic across
     /// nodes — the legacy code hashed `format!("{:?}", HashSet)`, whose
     /// iteration order is random per process.
-    #[allow(clippy::too_many_arguments)] // one arg per hashed field, by design
-    fn signing_bytes(
-        kind: TxKind,
-        sender: &str,
-        receiver: &str,
-        amount: u64,
-        memo: &str,
-        parents: &[String],
-        timestamp: u64,
-        public_key: &[u8],
-    ) -> Vec<u8> {
+    fn bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
         let mut put = |bytes: &[u8]| {
             out.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
             out.extend_from_slice(bytes);
         };
-        put(b"timecoin-tx-v1");
-        put(match kind {
+        put(b"timecoin-tx-v2");
+        put(match self.kind {
             TxKind::Reward => b"reward",
             TxKind::Transfer => b"transfer",
         });
-        put(sender.as_bytes());
-        put(receiver.as_bytes());
-        put(&amount.to_be_bytes());
-        put(memo.as_bytes());
-        for p in parents {
+        put(self.sender.as_bytes());
+        put(self.receiver.as_bytes());
+        put(&self.amount.to_be_bytes());
+        put(&self.seq.to_be_bytes());
+        put(self.memo.as_bytes());
+        for p in self.parents {
             put(p.as_bytes());
         }
-        put(&timestamp.to_be_bytes());
-        put(public_key);
+        put(&self.timestamp.to_be_bytes());
+        put(self.public_key);
         out
     }
+}
 
-    #[allow(clippy::too_many_arguments)]
+impl Transaction {
+    fn signing_bytes(&self) -> Vec<u8> {
+        SigningFields {
+            kind: self.kind,
+            sender: &self.sender,
+            receiver: &self.receiver,
+            amount: self.amount,
+            seq: self.seq,
+            memo: &self.memo,
+            parents: &self.parents,
+            timestamp: self.timestamp,
+            public_key: &self.public_key,
+        }
+        .bytes()
+    }
+
+    #[allow(clippy::too_many_arguments)] // one arg per hashed field, by design
     pub fn create(
         kind: TxKind,
         keypair: &Keypair,
         sender: String,
         receiver: String,
         amount: u64,
+        seq: u64,
         memo: String,
         mut parents: Vec<String>,
         timestamp: u64,
@@ -112,29 +148,29 @@ impl Transaction {
         parents.sort();
         parents.dedup();
         let public_key = keypair.public().encode_protobuf();
-        let bytes = Self::signing_bytes(
-            kind, &sender, &receiver, amount, &memo, &parents, timestamp, &public_key,
-        );
-        let id = hex::encode(Sha256::digest(&bytes));
-        let signature = keypair.sign(&bytes).context("signing transaction")?;
-        Ok(Self {
-            id,
+        let mut tx = Self {
+            id: String::new(),
             kind,
             sender,
             receiver,
             amount,
+            seq,
             memo,
             parents,
             timestamp,
             public_key,
-            signature,
-        })
+            signature: vec![],
+        };
+        let bytes = tx.signing_bytes();
+        tx.id = hex::encode(Sha256::digest(&bytes));
+        tx.signature = keypair.sign(&bytes).context("signing transaction")?;
+        Ok(tx)
     }
 
-    /// Structural validation: id matches content, signature verifies, and for
-    /// transfers the sender wallet must belong to the signing key. This is
-    /// deterministic — every node reaches the same verdict — which is what
-    /// makes the DAG converge.
+    /// Structural validation: id matches content, signature verifies, and the
+    /// signer is authorized (transfers: signer owns the sending wallet;
+    /// rewards: signer is vouching for someone *else*). Deterministic — every
+    /// node reaches the same verdict — which is what makes the DAG converge.
     pub fn validate(&self) -> Result<()> {
         if self.amount == 0 {
             bail!("amount must be positive");
@@ -144,16 +180,7 @@ impl Transaction {
         if sorted != self.parents {
             bail!("parents not in canonical (sorted) order");
         }
-        let bytes = Self::signing_bytes(
-            self.kind,
-            &self.sender,
-            &self.receiver,
-            self.amount,
-            &self.memo,
-            &self.parents,
-            self.timestamp,
-            &self.public_key,
-        );
+        let bytes = self.signing_bytes();
         if hex::encode(Sha256::digest(&bytes)) != self.id {
             bail!("transaction id does not match contents");
         }
@@ -162,8 +189,27 @@ impl Transaction {
         if !key.verify(&bytes, &self.signature) {
             bail!("signature verification failed");
         }
-        if self.kind == TxKind::Transfer && wallet_address(&key.to_peer_id()) != self.sender {
-            bail!("transfer not signed by the sender's key");
+        let signer_wallet = wallet_address(&key.to_peer_id());
+        match self.kind {
+            TxKind::Transfer => {
+                if signer_wallet != self.sender {
+                    bail!("transfer not signed by the sender's key");
+                }
+                if self.sender == self.receiver {
+                    bail!("transfer to self is pointless");
+                }
+            }
+            TxKind::Reward => {
+                if signer_wallet != self.sender {
+                    bail!("reward attester must record their own wallet as sender");
+                }
+                if signer_wallet == self.receiver {
+                    bail!("cannot mint a reward to yourself — rewards are attestations by others");
+                }
+                if self.seq != 0 {
+                    bail!("rewards carry no sequence number");
+                }
+            }
         }
         Ok(())
     }
@@ -173,71 +219,65 @@ impl Transaction {
     }
 }
 
-/// The two genesis transactions every node computes identically, so all DAGs
-/// share the same roots (the legacy bootstrap generated them with random RSA
-/// keys, so no two nodes ever agreed on genesis).
-pub fn genesis() -> Vec<Transaction> {
+/// The two genesis transactions every node of a named network computes
+/// identically, so all DAGs of that network share the same roots — and DAGs
+/// of *different* networks share nothing.
+pub fn genesis(network: &str) -> Vec<Transaction> {
+    let memo = format!("genesis:{network}");
     let g = |receiver: &str, parents: Vec<String>| {
-        let bytes = Transaction::signing_bytes(
-            TxKind::Reward,
-            "System",
-            receiver,
-            1,
-            "genesis",
-            &parents,
-            0,
-            &[],
-        );
-        Transaction {
-            id: hex::encode(Sha256::digest(&bytes)),
+        let mut tx = Transaction {
+            id: String::new(),
             kind: TxKind::Reward,
             sender: "System".into(),
             receiver: receiver.into(),
             amount: 1,
-            memo: "genesis".into(),
+            seq: 0,
+            memo: memo.clone(),
             parents,
             timestamp: 0,
             public_key: vec![],
             signature: vec![],
-        }
+        };
+        tx.id = hex::encode(Sha256::digest(tx.signing_bytes()));
+        tx
     };
     let g1 = g("SystemReceiver1", vec![]);
-    let mut g2 = g("SystemReceiver2", vec![]);
     // Second genesis references the first, as in the legacy bootstrap.
-    g2.parents = vec![g1.id.clone()];
-    let bytes = Transaction::signing_bytes(
-        TxKind::Reward,
-        "System",
-        "SystemReceiver2",
-        1,
-        "genesis",
-        &g2.parents,
-        0,
-        &[],
-    );
-    g2.id = hex::encode(Sha256::digest(&bytes));
+    let g2 = g("SystemReceiver2", vec![g1.id.clone()]);
     vec![g1, g2]
+}
+
+/// The balances and the set of transfers that actually took effect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LedgerState {
+    pub balances: BTreeMap<String, i64>,
+    /// Ids of transfers applied by the fold. Rewards always apply.
+    pub applied_transfers: HashSet<String>,
 }
 
 /// In-memory DAG with append-only on-disk persistence (JSON lines).
 pub struct Dag {
+    network: String,
     transactions: HashMap<String, Transaction>,
     /// Ids referenced as a parent by at least one accepted transaction.
     referenced: HashSet<String>,
     /// Valid transactions waiting for missing parents, by missing parent id.
     orphans: HashMap<String, Vec<Transaction>>,
+    orphan_count: usize,
     log_path: Option<PathBuf>,
 }
 
 impl Dag {
-    pub fn new() -> Self {
+    pub fn new(network: &str) -> Self {
         let mut dag = Self {
+            network: network.to_string(),
             transactions: HashMap::new(),
             referenced: HashSet::new(),
             orphans: HashMap::new(),
+            orphan_count: 0,
             log_path: None,
         };
-        for g in genesis() {
+        for g in genesis(network) {
             dag.accept(g);
         }
         dag
@@ -245,8 +285,8 @@ impl Dag {
 
     /// Load from `dir/dag.jsonl`, creating a fresh DAG (genesis only) if the
     /// file doesn't exist. Every stored transaction is re-validated on load.
-    pub fn load(dir: &Path) -> Result<Self> {
-        let mut dag = Self::new();
+    pub fn load(dir: &Path, network: &str) -> Result<Self> {
+        let mut dag = Self::new(network);
         let path = dir.join("dag.jsonl");
         if path.exists() {
             let data = std::fs::read_to_string(&path)
@@ -281,10 +321,6 @@ impl Dag {
         self.transactions.values()
     }
 
-    pub fn all_ids(&self) -> Vec<String> {
-        self.transactions.keys().cloned().collect()
-    }
-
     /// Current tips: accepted transactions no one references yet.
     pub fn tips(&self) -> Vec<String> {
         let mut tips: Vec<String> = self
@@ -297,9 +333,39 @@ impl Dag {
         tips
     }
 
+    /// The requested transactions plus missing-side ancestry, breadth-first,
+    /// capped — lets a syncing peer pull whole generations per round trip.
+    pub fn with_ancestry(&self, ids: &[String], cap: usize) -> Vec<Transaction> {
+        let mut out = Vec::new();
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut queue: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
+        while let Some(id) = queue.pop() {
+            if out.len() >= cap || !seen.insert(id) {
+                continue;
+            }
+            if let Some(tx) = self.transactions.get(id) {
+                out.push(tx.clone());
+                queue.extend(tx.parents.iter().map(|p| p.as_str()));
+            }
+        }
+        out
+    }
+
     /// Missing parent ids currently blocking orphans — what to ask peers for.
     pub fn missing_parents(&self) -> Vec<String> {
         self.orphans.keys().cloned().collect()
+    }
+
+    /// The next sequence number this wallet should use for a transfer:
+    /// one past the highest it has ever signed (applied or not), so an honest
+    /// client never conflicts with itself.
+    pub fn next_seq(&self, wallet: &str) -> u64 {
+        self.transactions
+            .values()
+            .filter(|tx| tx.kind == TxKind::Transfer && tx.sender == wallet)
+            .map(|tx| tx.seq + 1)
+            .max()
+            .unwrap_or(0)
     }
 
     fn accept(&mut self, tx: Transaction) {
@@ -325,11 +391,15 @@ impl Dag {
         }
         if !tx.is_genesis() {
             tx.validate()?;
-        } else if !genesis().iter().any(|g| g.id == tx.id) {
-            bail!("unknown genesis transaction");
+        } else if !genesis(&self.network).iter().any(|g| g.id == tx.id) {
+            bail!("unknown genesis transaction (different --network?)");
         }
 
         if let Some(missing) = tx.parents.iter().find(|p| !self.contains(p)) {
+            if self.orphan_count >= MAX_ORPHANS {
+                bail!("orphan pool full");
+            }
+            self.orphan_count += 1;
             self.orphans.entry(missing.clone()).or_default().push(tx);
             return Ok(vec![]);
         }
@@ -341,12 +411,14 @@ impl Dag {
         let mut queue: Vec<String> = vec![accepted[0].id.clone()];
         while let Some(id) = queue.pop() {
             let Some(waiting) = self.orphans.remove(&id) else { continue };
+            self.orphan_count -= waiting.len();
             for w in waiting {
                 if self.contains(&w.id) {
                     continue;
                 }
                 if let Some(missing) = w.parents.iter().find(|p| !self.contains(p)) {
                     let missing = missing.clone();
+                    self.orphan_count += 1;
                     self.orphans.entry(missing).or_default().push(w);
                 } else {
                     queue.push(w.id.clone());
@@ -358,22 +430,69 @@ impl Dag {
         Ok(accepted)
     }
 
-    /// Balances derived by folding over the DAG: rewards mint, transfers move.
-    /// A BTreeMap so output ordering is stable everywhere.
-    pub fn balances(&self) -> BTreeMap<String, i64> {
+    /// Deterministic ledger fold — a pure function of the transaction *set*,
+    /// so every node that has the same DAG computes the same balances no
+    /// matter what order transactions arrived in.
+    ///
+    /// 1. All rewards apply (they only add; order is irrelevant).
+    /// 2. For each (sender, seq) the winner is the lowest tx id — a
+    ///    double-spend's loser is dead on every node identically.
+    /// 3. Winners apply in fixpoint passes ordered by (sender, seq, id): a
+    ///    transfer applies only when its seq is the sender's next *and* the
+    ///    sender's balance covers it. Passes repeat until nothing changes,
+    ///    so transfers funded by other transfers settle regardless of
+    ///    ordering. An unfunded transfer (modified client) simply never
+    ///    applies — balances cannot go negative.
+    pub fn ledger(&self) -> LedgerState {
         let mut balances: BTreeMap<String, i64> = BTreeMap::new();
         for tx in self.transactions.values() {
-            match tx.kind {
-                TxKind::Reward => {
-                    *balances.entry(tx.receiver.clone()).or_default() += tx.amount as i64;
-                }
-                TxKind::Transfer => {
-                    *balances.entry(tx.sender.clone()).or_default() -= tx.amount as i64;
-                    *balances.entry(tx.receiver.clone()).or_default() += tx.amount as i64;
-                }
+            if tx.kind == TxKind::Reward {
+                *balances.entry(tx.receiver.clone()).or_default() += tx.amount as i64;
             }
         }
-        balances
+
+        // Winner per (sender, seq): lowest id.
+        let mut winners: BTreeMap<(String, u64), &Transaction> = BTreeMap::new();
+        for tx in self.transactions.values().filter(|t| t.kind == TxKind::Transfer) {
+            winners
+                .entry((tx.sender.clone(), tx.seq))
+                .and_modify(|cur| {
+                    if tx.id < cur.id {
+                        *cur = tx;
+                    }
+                })
+                .or_insert(tx);
+        }
+
+        let mut applied: HashSet<String> = HashSet::new();
+        let mut next_seq: HashMap<&str, u64> = HashMap::new();
+        loop {
+            let mut progress = false;
+            for ((sender, seq), tx) in &winners {
+                if applied.contains(&tx.id) {
+                    continue;
+                }
+                if *seq != *next_seq.get(sender.as_str()).unwrap_or(&0) {
+                    continue;
+                }
+                let balance = balances.get(sender).copied().unwrap_or(0);
+                if balance >= tx.amount as i64 {
+                    *balances.entry(tx.sender.clone()).or_default() -= tx.amount as i64;
+                    *balances.entry(tx.receiver.clone()).or_default() += tx.amount as i64;
+                    next_seq.insert(sender.as_str(), seq + 1);
+                    applied.insert(tx.id.clone());
+                    progress = true;
+                }
+            }
+            if !progress {
+                break;
+            }
+        }
+        LedgerState { balances, applied_transfers: applied }
+    }
+
+    pub fn balances(&self) -> BTreeMap<String, i64> {
+        self.ledger().balances
     }
 
     pub fn balance(&self, wallet: &str) -> i64 {
@@ -395,17 +514,25 @@ fn append_line(path: &Path, tx: &Transaction) -> Result<()> {
 mod tests {
     use super::*;
 
+    const NET: &str = "test";
+
     fn keypair() -> Keypair {
         Keypair::generate_ed25519()
     }
 
-    fn reward_to(dag: &Dag, key: &Keypair, wallet: &str, amount: u64) -> Transaction {
+    fn wallet_of(key: &Keypair) -> String {
+        wallet_address(&key.public().to_peer_id())
+    }
+
+    /// `attester` vouches that `wallet` contributed.
+    fn reward_to(dag: &Dag, attester: &Keypair, wallet: &str, amount: u64) -> Transaction {
         Transaction::create(
             TxKind::Reward,
-            key,
-            wallet_address(&key.public().to_peer_id()),
+            attester,
+            wallet_of(attester),
             wallet.to_string(),
             amount,
+            0,
             "test contribution".into(),
             dag.tips(),
             1,
@@ -413,50 +540,73 @@ mod tests {
         .unwrap()
     }
 
-    #[test]
-    fn genesis_is_deterministic() {
-        assert_eq!(
-            genesis().iter().map(|g| g.id.clone()).collect::<Vec<_>>(),
-            genesis().iter().map(|g| g.id.clone()).collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn reward_then_transfer_updates_balances() {
-        let key = keypair();
-        let wallet = wallet_address(&key.public().to_peer_id());
-        let mut dag = Dag::new();
-
-        let r = reward_to(&dag, &key, &wallet, 100);
-        dag.insert(r).unwrap();
-        assert_eq!(dag.balance(&wallet), 100);
-
-        let t = Transaction::create(
+    fn transfer(
+        dag: &Dag,
+        key: &Keypair,
+        to: &str,
+        amount: u64,
+        seq: u64,
+    ) -> Transaction {
+        Transaction::create(
             TxKind::Transfer,
-            &key,
-            wallet.clone(),
-            "0xfriend".into(),
-            40,
+            key,
+            wallet_of(key),
+            to.to_string(),
+            amount,
+            seq,
             String::new(),
             dag.tips(),
             2,
         )
-        .unwrap();
-        dag.insert(t).unwrap();
-        assert_eq!(dag.balance(&wallet), 60);
-        assert_eq!(dag.balance("0xfriend"), 40);
+        .unwrap()
+    }
+
+    #[test]
+    fn genesis_is_deterministic_and_network_scoped() {
+        let a = genesis("main").iter().map(|g| g.id.clone()).collect::<Vec<_>>();
+        let b = genesis("main").iter().map(|g| g.id.clone()).collect::<Vec<_>>();
+        let c = genesis("koop").iter().map(|g| g.id.clone()).collect::<Vec<_>>();
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn cannot_mint_to_yourself() {
+        let key = keypair();
+        let dag = Dag::new(NET);
+        let selfish = reward_to(&dag, &key, &wallet_of(&key), 1000);
+        assert!(selfish.validate().is_err());
+        let mut dag = dag;
+        assert!(dag.insert(selfish).is_err());
+    }
+
+    #[test]
+    fn attested_reward_then_transfer_updates_balances() {
+        let alice = keypair();
+        let bob = keypair();
+        let mut dag = Dag::new(NET);
+
+        // Bob attests Alice contributed.
+        dag.insert(reward_to(&dag, &bob, &wallet_of(&alice), 100)).unwrap();
+        assert_eq!(dag.balance(&wallet_of(&alice)), 100);
+
+        // Alice pays Bob 40.
+        dag.insert(transfer(&dag, &alice, &wallet_of(&bob), 40, 0)).unwrap();
+        assert_eq!(dag.balance(&wallet_of(&alice)), 60);
+        assert_eq!(dag.balance(&wallet_of(&bob)), 40);
     }
 
     #[test]
     fn transfer_must_be_signed_by_sender() {
         let key = keypair();
-        let dag = Dag::new();
+        let dag = Dag::new(NET);
         let t = Transaction::create(
             TxKind::Transfer,
             &key,
             "0xsomeoneelse".into(),
             "0xfriend".into(),
             5,
+            0,
             String::new(),
             dag.tips(),
             2,
@@ -468,23 +618,92 @@ mod tests {
     #[test]
     fn tampered_amount_fails_validation() {
         let key = keypair();
-        let dag = Dag::new();
+        let dag = Dag::new(NET);
         let mut r = reward_to(&dag, &key, "0xw", 10);
         r.amount = 1000;
         assert!(r.validate().is_err());
     }
 
     #[test]
+    fn overdraft_never_applies_network_wide() {
+        let alice = keypair();
+        let bob = keypair();
+        let mut dag = Dag::new(NET);
+        dag.insert(reward_to(&dag, &bob, &wallet_of(&alice), 10)).unwrap();
+
+        // A modified client signs a structurally valid transfer of 1000.
+        let overdraft = transfer(&dag, &alice, &wallet_of(&bob), 1000, 0);
+        dag.insert(overdraft.clone()).unwrap(); // accepted into the DAG…
+
+        let ledger = dag.ledger();
+        assert!(!ledger.applied_transfers.contains(&overdraft.id)); // …but never applied
+        assert_eq!(dag.balance(&wallet_of(&alice)), 10);
+        assert!(dag.balances().values().all(|b| *b >= 0));
+    }
+
+    #[test]
+    fn double_spend_resolves_identically_regardless_of_arrival_order() {
+        let alice = keypair();
+        let bob = keypair();
+        let mut base = Dag::new(NET);
+        base.insert(reward_to(&base, &bob, &wallet_of(&alice), 100)).unwrap();
+
+        // Alice signs two conflicting seq-0 transfers spending the same 100.
+        let spend_x = transfer(&base, &alice, "0xmerchant_x", 100, 0);
+        let spend_y = transfer(&base, &alice, "0xmerchant_y", 100, 0);
+
+        let mut a = Dag::new(NET);
+        for tx in base.all().cloned().collect::<Vec<_>>() {
+            let _ = a.insert(tx);
+        }
+        let mut b = Dag::new(NET);
+        for tx in base.all().cloned().collect::<Vec<_>>() {
+            let _ = b.insert(tx);
+        }
+
+        a.insert(spend_x.clone()).unwrap();
+        a.insert(spend_y.clone()).unwrap();
+        b.insert(spend_y.clone()).unwrap();
+        b.insert(spend_x.clone()).unwrap();
+
+        assert_eq!(a.balances(), b.balances());
+        let winner = if spend_x.id < spend_y.id { &spend_x } else { &spend_y };
+        assert!(a.ledger().applied_transfers.contains(&winner.id));
+        assert_eq!(a.ledger().applied_transfers.len(), 1);
+        // Exactly one merchant got paid, on both nodes.
+        let paid: i64 = a.balances().get("0xmerchant_x").copied().unwrap_or(0)
+            + a.balances().get("0xmerchant_y").copied().unwrap_or(0);
+        assert_eq!(paid, 100);
+    }
+
+    #[test]
+    fn chained_transfers_settle_regardless_of_fold_input_order() {
+        let alice = keypair();
+        let bob = keypair();
+        let carol = keypair();
+        let attester = keypair();
+        let mut dag = Dag::new(NET);
+        // attester funds alice; alice pays bob; bob pays carol.
+        dag.insert(reward_to(&dag, &attester, &wallet_of(&alice), 50)).unwrap();
+        dag.insert(transfer(&dag, &alice, &wallet_of(&bob), 50, 0)).unwrap();
+        dag.insert(transfer(&dag, &bob, &wallet_of(&carol), 30, 0)).unwrap();
+
+        assert_eq!(dag.balance(&wallet_of(&alice)), 0);
+        assert_eq!(dag.balance(&wallet_of(&bob)), 20);
+        assert_eq!(dag.balance(&wallet_of(&carol)), 30);
+    }
+
+    #[test]
     fn orphans_resolve_when_parent_arrives() {
-        let key = keypair();
-        let mut a = Dag::new();
-        let r1 = reward_to(&a, &key, "0xw", 10);
+        let attester = keypair();
+        let mut a = Dag::new(NET);
+        let r1 = reward_to(&a, &attester, "0xw", 10);
         a.insert(r1.clone()).unwrap();
-        let r2 = reward_to(&a, &key, "0xw", 20); // parents include r1
+        let r2 = reward_to(&a, &attester, "0xw", 20); // parents include r1
         a.insert(r2.clone()).unwrap();
 
         // Node B receives child before parent.
-        let mut b = Dag::new();
+        let mut b = Dag::new(NET);
         assert!(b.insert(r2.clone()).unwrap().is_empty());
         assert!(!b.contains(&r2.id));
         assert_eq!(b.missing_parents(), vec![r1.id.clone()]);
@@ -496,22 +715,16 @@ mod tests {
     }
 
     #[test]
-    fn two_dags_converge_regardless_of_order() {
-        let k1 = keypair();
-        let k2 = keypair();
-        let mut a = Dag::new();
-        let tx1 = reward_to(&a, &k1, "0xalice", 50);
-        a.insert(tx1.clone()).unwrap();
-        let tx2 = reward_to(&a, &k2, "0xbob", 30);
-        a.insert(tx2.clone()).unwrap();
-
-        let mut b = Dag::new();
-        b.insert(tx2.clone()).unwrap();
-        b.insert(tx1.clone()).unwrap();
-
-        assert_eq!(a.balances(), b.balances());
-        assert_eq!(a.tips(), b.tips());
-        assert_eq!(a.len(), b.len());
+    fn with_ancestry_returns_reachable_history() {
+        let attester = keypair();
+        let mut dag = Dag::new(NET);
+        let r1 = reward_to(&dag, &attester, "0xw", 10);
+        dag.insert(r1).unwrap();
+        let r2 = reward_to(&dag, &attester, "0xw", 20);
+        dag.insert(r2.clone()).unwrap();
+        // From the single tip, ancestry reaches everything.
+        let txs = dag.with_ancestry(&[r2.id.clone()], 100);
+        assert_eq!(txs.len(), dag.len());
     }
 
     #[test]
@@ -519,13 +732,13 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("timecoin-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let key = keypair();
+        let attester = keypair();
         {
-            let mut dag = Dag::load(&dir).unwrap();
-            let r = reward_to(&dag, &key, "0xw", 10);
+            let mut dag = Dag::load(&dir, NET).unwrap();
+            let r = reward_to(&dag, &attester, "0xw", 10);
             dag.insert(r).unwrap();
         }
-        let dag = Dag::load(&dir).unwrap();
+        let dag = Dag::load(&dir, NET).unwrap();
         assert_eq!(dag.balance("0xw"), 10);
         assert_eq!(dag.len(), 3); // 2 genesis + 1 reward
         let _ = std::fs::remove_dir_all(&dir);

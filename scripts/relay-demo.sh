@@ -26,8 +26,9 @@ $BIN run --no-mdns --data-dir "$DIR/natted" --port 9302 --api 127.0.0.1:3302 \
     --bootstrap "$RELAY_ADDR" --relay "$RELAY_ADDR" >"$DIR/natted.log" 2>&1 &
 sleep 3
 
-echo "== minting a contribution on the NATed node"
-$BIN reward --api 127.0.0.1:3302 --amount 77 --memo "made behind NAT" >/dev/null
+echo "== relay attests a contribution by the NATed node (rewards are attestations by others)"
+NATTED_ID=$($BIN status --api 127.0.0.1:3302 | jqget "d['peer_id']")
+$BIN reward --api 127.0.0.1:3301 --to "$NATTED_ID" --amount 77 --memo "made behind NAT" >/dev/null
 
 CIRCUIT=$($BIN status --api 127.0.0.1:3302 \
     | jqget "[a for a in d['listen_addrs'] if 'p2p-circuit' in a][0]")
