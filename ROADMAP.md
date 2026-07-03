@@ -57,22 +57,29 @@ The MVP converges, but anyone can mint and a modified client can double-spend. F
 - **Observability:** a tiny web dashboard on the node (peers, tips, balances, live tx
   feed) — because a network you can't see doesn't feel real.
 
-## Stage 3 — a network of people, not processes
+## Stage 3 — a network of people, not processes *(core shipped)*
 
-What's needed before strangers can coexist (design sketches, not yet built):
-
-- **Web-of-trust minting weight.** Wallets accumulate *vouches* (a signed statement, on
-  the ledger). A reward's "weight" discounts by the minter's trust distance from the
-  viewer. Communities effectively define their own money supply socially — which is what
-  a koop already is. This is the honest answer to Sybil: not proof-of-work, but
-  proof-of-being-known.
-- **Rate limits & spam control:** per-wallet mint budgets per epoch (community-config),
-  gossip validation quotas per peer, and proof-of-relay for message forwarding.
-- **Aliases & profiles:** human-readable names bound to wallets by on-ledger records
-  (first-claim + community vouching), replacing raw 0x… addresses in every UI.
-- **Bootstrap infrastructure:** a community config file (network name, bootstrap +
-  relay addresses, initial trusted wallets) shareable as one small JSON/QR — "join my
-  network" becomes sending one file.
+- **Web-of-trust views** *(shipped)*: wallets place signed **vouches** on the ledger;
+  every node can compute its trust neighborhood (BFS over vouch edges, depth-limited)
+  and view **trusted balances** that count only rewards minted by vouched-for wallets.
+  Sybil money is visible in the raw view and worthless in the trusted view. This is the
+  honest answer to Sybil: not proof-of-work, but proof-of-being-known. *Still simple on
+  purpose:* trust is binary within the horizon (no per-hop decay weighting yet), there
+  is no revocation of a vouch yet, and services (e.g. storage pricing) don't consult
+  trust yet.
+- **Display names** *(shipped)*: a wallet can set a name shown in UIs. Deliberately
+  *not* unique identities — enforcing first-claim uniqueness on a DAG without total
+  ordering is grind-vulnerable (lowest-hash "first" can be mined), so names are honest
+  labels and the wallet stays the identity. Unique aliases need Stage 4-style ordering
+  or community registrars.
+- **One-file community join** *(shipped)*: `timecoin-node join-file` emits
+  `{network, bootstrap, relay}`; a friend runs `run --config that-file.json`.
+- **Rate limits & mint budgets** *(open problem, deliberately not faked)*: per-epoch
+  budgets need all nodes to agree which epoch a transaction belongs to, but DAG
+  timestamps are self-claimed — deterministic enforcement either needs anchored time
+  (checkpoint transactions) or acceptance windows that break convergence at the edges.
+  Design note kept here until there's an answer that doesn't cheat. In the meantime,
+  trusted views make untrusted mint-spam *ignorable* rather than preventable.
 
 ## Stage 4 — the marketplace layer
 

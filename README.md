@@ -21,7 +21,11 @@ vs. deferred: [SCOPE.md](SCOPE.md). How the old fork-based code was assessed and
   every node computes identically: double-spends resolve to the same winner everywhere,
   and an overdrafting transaction — even from a modified client — simply never applies.
   Network-wide balances cannot go negative.
-- Communities are isolated: `--network koop` has its own genesis, topics, and protocols.
+- **Trust is social.** You `vouch` for wallets you know; your *trusted view* of balances
+  counts only rewards minted inside your vouch neighborhood, so a stranger's self-minted
+  fortune is worth nothing to you. Wallets can set display names (labels, not identities).
+- Communities are isolated: `--network koop` has its own genesis, topics, and protocols —
+  and joining one is a single `join-file` handed to a friend.
 
 ## Quickstart (one machine)
 
@@ -57,6 +61,16 @@ tc inbox   --api 127.0.0.1:3002
 # pay node 1 to store data (1 TC per started 100 KiB by default)
 tc store --api 127.0.0.1:3002 --peer $NODE1 --text "important note"
 tc fetch --api 127.0.0.1:3002 --peer $NODE1 --hash <hash from store>
+
+# web of trust: set a name, vouch for people you know, view trusted balances
+tc name  --api 127.0.0.1:3001 --set umut
+tc vouch --api 127.0.0.1:3001 --to $NODE2
+tc trust --api 127.0.0.1:3001
+tc balances --api 127.0.0.1:3001 --trusted   # only vouched-for minters count
+
+# invite a friend: hand them one file
+tc join-file --api 127.0.0.1:3001 > my-community.json
+# friend runs: tc run --data-dir ./data --config my-community.json
 
 # same answers from any node
 tc balances --api 127.0.0.1:3001
@@ -134,6 +148,9 @@ must run one reachable node.
 | `/peers`, `/tips`, `/transactions`, `/balances`, `/balance` | GET | the ledger, from this node's view (`/transactions` flags each transfer `applied` or not) |
 | `/reward` | POST | `{"to": "wallet or peer id", "amount": 100, "memo": "…"}` — attest someone else's contribution |
 | `/send` | POST | `{"to": "wallet or peer id", "amount": 40}` — transfer |
+| `/vouch` | POST | `{"to": "wallet or peer id"}` — on-ledger statement of trust |
+| `/trust?depth=3` | GET | your vouch neighborhood; `?trusted=true` on `/balance(s)` uses it |
+| `/name` POST, `/names` GET | | display names (labels, not unique identities) |
 | `/message` | POST | `{"peer_id": "…", "text": "…"}` — encrypted direct message |
 | `/messages` | GET | this node's inbox |
 | `/store` | POST | `{"peer_id": "…", "text": "…"}` or `{"peer_id": "…", "data_base64": "…"}` — quote, pay, store |
@@ -159,9 +176,10 @@ inside the compose network for the demo).
 - Relay fallback verified end to end (`scripts/relay-demo.sh`); one-command docker cluster.
 
 **Doesn't work / doesn't exist (on purpose, for now — see ROADMAP.md):**
-- **No Sybil resistance:** one human with two keys can attest themselves. Rewards are
-  attributable (you can see who vouched), but trust weighting is Stage 3. Keep networks
-  private to people you trust.
+- **Sybil resistance is social, not cryptographic:** a stranger can still mint freely in
+  the *raw* view; the trusted view makes that money worthless to you, but services don't
+  consult trust yet when accepting payment, there's no vouch revocation, and no per-hop
+  trust decay. Keep networks private to people you trust.
 - **No proof of continued storage:** a paid provider could delete your blob later and
   keep the payment; there's no challenge protocol or escrow yet (Stage 4). Also, if a
   provider refuses after taking payment, the payment is not automatically refunded.

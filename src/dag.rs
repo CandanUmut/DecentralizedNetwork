@@ -39,6 +39,12 @@ pub enum TxKind {
     /// Moves `amount` from `sender` to `receiver`. `seq` is the sender's
     /// transfer sequence number (0, 1, 2, …).
     Transfer,
+    /// Signer (`sender`) states they know and trust the wallet in
+    /// `receiver`. No balance effect; feeds the web-of-trust views.
+    Vouch,
+    /// Signer sets their own display name (in `memo`). Non-unique label —
+    /// the wallet is the identity, the name is decoration. Latest wins.
+    Profile,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -102,6 +108,8 @@ impl SigningFields<'_> {
         put(match self.kind {
             TxKind::Reward => b"reward",
             TxKind::Transfer => b"transfer",
+            TxKind::Vouch => b"vouch",
+            TxKind::Profile => b"profile",
         });
         put(self.sender.as_bytes());
         put(self.receiver.as_bytes());
@@ -172,8 +180,20 @@ impl Transaction {
     /// rewards: signer is vouching for someone *else*). Deterministic — every
     /// node reaches the same verdict — which is what makes the DAG converge.
     pub fn validate(&self) -> Result<()> {
-        if self.amount == 0 {
-            bail!("amount must be positive");
+        match self.kind {
+            TxKind::Reward | TxKind::Transfer => {
+                if self.amount == 0 {
+                    bail!("amount must be positive");
+                }
+            }
+            TxKind::Vouch | TxKind::Profile => {
+                if self.amount != 0 {
+                    bail!("vouch/profile transactions carry no amount");
+                }
+                if self.seq != 0 {
+                    bail!("vouch/profile transactions carry no sequence number");
+                }
+            }
         }
         let mut sorted = self.parents.clone();
         sorted.sort();
@@ -208,6 +228,22 @@ impl Transaction {
                 }
                 if self.seq != 0 {
                     bail!("rewards carry no sequence number");
+                }
+            }
+            TxKind::Vouch => {
+                if signer_wallet != self.sender {
+                    bail!("vouch must be signed by the vouching wallet");
+                }
+                if signer_wallet == self.receiver {
+                    bail!("cannot vouch for yourself");
+                }
+            }
+            TxKind::Profile => {
+                if signer_wallet != self.sender || self.sender != self.receiver {
+                    bail!("profile must be self-signed and self-addressed");
+                }
+                if self.memo.is_empty() || self.memo.len() > 32 || !self.memo.chars().all(|c| !c.is_control()) {
+                    bail!("display name must be 1..=32 printable characters");
                 }
             }
         }
@@ -444,10 +480,25 @@ impl Dag {
     ///    ordering. An unfunded transfer (modified client) simply never
     ///    applies — balances cannot go negative.
     pub fn ledger(&self) -> LedgerState {
+        self.ledger_view(None)
+    }
+
+    /// Like [`Dag::ledger`], but when `trusted` is given, only rewards minted
+    /// by a wallet in the trusted set (plus genesis) are counted — "balances
+    /// as seen by me, counting only coins vouched-for people created".
+    /// Transfers behave identically; they just can't be funded by untrusted
+    /// mints. Deterministic for a given (DAG, trusted set).
+    pub fn ledger_view(&self, trusted: Option<&BTreeMap<String, u32>>) -> LedgerState {
         let mut balances: BTreeMap<String, i64> = BTreeMap::new();
         for tx in self.transactions.values() {
             if tx.kind == TxKind::Reward {
-                *balances.entry(tx.receiver.clone()).or_default() += tx.amount as i64;
+                let counted = match trusted {
+                    None => true,
+                    Some(set) => tx.is_genesis() || set.contains_key(&tx.sender),
+                };
+                if counted {
+                    *balances.entry(tx.receiver.clone()).or_default() += tx.amount as i64;
+                }
             }
         }
 
@@ -497,6 +548,52 @@ impl Dag {
 
     pub fn balance(&self, wallet: &str) -> i64 {
         self.balances().get(wallet).copied().unwrap_or(0)
+    }
+
+    /// Wallets the viewer trusts, with their vouch distance: the viewer at
+    /// depth 0, everyone the viewer vouched for at 1, everyone *they*
+    /// vouched for at 2, … up to `max_depth` hops (BFS over vouch edges).
+    pub fn trusted_set(&self, viewer: &str, max_depth: u32) -> BTreeMap<String, u32> {
+        let mut edges: HashMap<&str, Vec<&str>> = HashMap::new();
+        for tx in self.transactions.values().filter(|t| t.kind == TxKind::Vouch) {
+            edges.entry(tx.sender.as_str()).or_default().push(tx.receiver.as_str());
+        }
+        let mut trusted: BTreeMap<String, u32> = BTreeMap::new();
+        trusted.insert(viewer.to_string(), 0);
+        let mut frontier: Vec<&str> = vec![viewer];
+        for depth in 1..=max_depth {
+            let mut next = Vec::new();
+            for wallet in frontier {
+                for vouched in edges.get(wallet).into_iter().flatten() {
+                    if !trusted.contains_key(*vouched) {
+                        trusted.insert(vouched.to_string(), depth);
+                        next.push(*vouched);
+                    }
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            frontier = next;
+        }
+        trusted
+    }
+
+    /// Latest self-declared display name per wallet (labels, not identities:
+    /// names are not unique and prove nothing — the wallet is the identity).
+    pub fn names(&self) -> BTreeMap<String, String> {
+        let mut latest: BTreeMap<String, &Transaction> = BTreeMap::new();
+        for tx in self.transactions.values().filter(|t| t.kind == TxKind::Profile) {
+            latest
+                .entry(tx.sender.clone())
+                .and_modify(|cur| {
+                    if (tx.timestamp, &tx.id) > (cur.timestamp, &cur.id) {
+                        *cur = tx;
+                    }
+                })
+                .or_insert(tx);
+        }
+        latest.into_iter().map(|(w, tx)| (w, tx.memo.clone())).collect()
     }
 }
 
@@ -691,6 +788,92 @@ mod tests {
         assert_eq!(dag.balance(&wallet_of(&alice)), 0);
         assert_eq!(dag.balance(&wallet_of(&bob)), 20);
         assert_eq!(dag.balance(&wallet_of(&carol)), 30);
+    }
+
+    fn vouch(dag: &Dag, voucher: &Keypair, for_wallet: &str) -> Transaction {
+        Transaction::create(
+            TxKind::Vouch,
+            voucher,
+            wallet_of(voucher),
+            for_wallet.to_string(),
+            0,
+            0,
+            String::new(),
+            dag.tips(),
+            3,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn cannot_vouch_for_yourself() {
+        let key = keypair();
+        let dag = Dag::new(NET);
+        let v = vouch(&dag, &key, &wallet_of(&key));
+        assert!(v.validate().is_err());
+    }
+
+    #[test]
+    fn trust_bfs_respects_depth() {
+        let a = keypair();
+        let b = keypair();
+        let c = keypair();
+        let mut dag = Dag::new(NET);
+        dag.insert(vouch(&dag, &a, &wallet_of(&b))).unwrap(); // a → b
+        dag.insert(vouch(&dag, &b, &wallet_of(&c))).unwrap(); // b → c
+
+        let depth1 = dag.trusted_set(&wallet_of(&a), 1);
+        assert!(depth1.contains_key(&wallet_of(&b)));
+        assert!(!depth1.contains_key(&wallet_of(&c)));
+
+        let depth2 = dag.trusted_set(&wallet_of(&a), 2);
+        assert_eq!(depth2.get(&wallet_of(&c)), Some(&2));
+        // Trust is directional: b never vouched for a.
+        assert!(!dag.trusted_set(&wallet_of(&c), 3).contains_key(&wallet_of(&a)));
+    }
+
+    #[test]
+    fn trusted_balances_ignore_unvouched_minters() {
+        let me = keypair();
+        let friend = keypair();
+        let stranger = keypair();
+        let worker = keypair();
+        let mut dag = Dag::new(NET);
+        dag.insert(vouch(&dag, &me, &wallet_of(&friend))).unwrap();
+        // Friend (trusted) mints 10 to worker; stranger mints 1000 to worker.
+        dag.insert(reward_to(&dag, &friend, &wallet_of(&worker), 10)).unwrap();
+        dag.insert(reward_to(&dag, &stranger, &wallet_of(&worker), 1000)).unwrap();
+
+        assert_eq!(dag.balance(&wallet_of(&worker)), 1010); // raw view
+        let trusted = dag.trusted_set(&wallet_of(&me), 3);
+        let view = dag.ledger_view(Some(&trusted));
+        assert_eq!(view.balances.get(&wallet_of(&worker)), Some(&10)); // my view
+    }
+
+    #[test]
+    fn profile_latest_name_wins_and_is_validated() {
+        let key = keypair();
+        let mut dag = Dag::new(NET);
+        let name = |dag: &Dag, text: &str, ts: u64| {
+            Transaction::create(
+                TxKind::Profile,
+                &key,
+                wallet_of(&key),
+                wallet_of(&key),
+                0,
+                0,
+                text.into(),
+                dag.tips(),
+                ts,
+            )
+            .unwrap()
+        };
+        dag.insert(name(&dag, "umut", 10)).unwrap();
+        dag.insert(name(&dag, "umut-v2", 20)).unwrap();
+        assert_eq!(dag.names().get(&wallet_of(&key)).map(String::as_str), Some("umut-v2"));
+
+        let too_long = name(&dag, &"x".repeat(33), 30);
+        assert!(too_long.validate().is_err());
     }
 
     #[test]

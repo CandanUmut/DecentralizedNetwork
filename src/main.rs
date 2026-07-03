@@ -6,6 +6,8 @@ mod network;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use libp2p::Multiaddr;
+use serde::Deserialize;
+use serde_json::Value;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -23,6 +25,10 @@ struct Cli {
 enum CliCommand {
     /// Run a node.
     Run {
+        /// Community join file (JSON with network/bootstrap/relay), as
+        /// emitted by `join-file`. Overrides those three flags.
+        #[arg(long)]
+        config: Option<PathBuf>,
         /// Directory for the node key, DAG, and stored blobs.
         #[arg(long, default_value = "./data")]
         data_dir: PathBuf,
@@ -89,6 +95,36 @@ enum CliCommand {
     Balances {
         #[arg(long, default_value = "127.0.0.1:3000")]
         api: String,
+        /// Count only rewards minted within your vouch neighborhood.
+        #[arg(long)]
+        trusted: bool,
+    },
+    /// State on the ledger that you know and trust a wallet/peer.
+    Vouch {
+        #[arg(long, default_value = "127.0.0.1:3000")]
+        api: String,
+        /// Wallet (0x…) or peer id you vouch for.
+        #[arg(long)]
+        to: String,
+    },
+    /// Show your trust neighborhood (wallets within N vouch hops).
+    Trust {
+        #[arg(long, default_value = "127.0.0.1:3000")]
+        api: String,
+        #[arg(long, default_value_t = 3)]
+        depth: u32,
+    },
+    /// Set your wallet's display name (a label, not a unique identity).
+    Name {
+        #[arg(long, default_value = "127.0.0.1:3000")]
+        api: String,
+        #[arg(long)]
+        set: String,
+    },
+    /// Print a community join file a friend can use with `run --config`.
+    JoinFile {
+        #[arg(long, default_value = "127.0.0.1:3000")]
+        api: String,
     },
     /// Send a direct encrypted message to a connected peer.
     Message {
@@ -127,6 +163,16 @@ enum CliCommand {
     },
 }
 
+/// A community join file: everything a friend needs to join your network.
+#[derive(Deserialize)]
+struct JoinFile {
+    network: String,
+    #[serde(default)]
+    bootstrap: Vec<Multiaddr>,
+    #[serde(default)]
+    relay: Option<Multiaddr>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -137,17 +183,28 @@ async fn main() -> Result<()> {
 
     match Cli::parse().command {
         CliCommand::Run {
+            config,
             data_dir,
-            network,
+            mut network,
             port,
             api,
-            bootstrap,
-            relay,
+            mut bootstrap,
+            mut relay,
             external_address,
             no_mdns,
             blob_price,
             blob_max_kib,
         } => {
+            if let Some(path) = config {
+                let join: JoinFile = serde_json::from_str(
+                    &std::fs::read_to_string(&path)
+                        .with_context(|| format!("reading {}", path.display()))?,
+                )
+                .with_context(|| format!("parsing join file {}", path.display()))?;
+                network = join.network;
+                bootstrap = join.bootstrap;
+                relay = join.relay;
+            }
             let config = network::Config {
                 network,
                 enable_mdns: !no_mdns,
@@ -158,8 +215,34 @@ async fn main() -> Result<()> {
             run(data_dir, port, api, bootstrap, relay, external_address, config).await
         }
         CliCommand::Status { api } => print_json(&get(&api, "/status")?),
-        CliCommand::Balances { api } => print_json(&get(&api, "/balances")?),
+        CliCommand::Balances { api, trusted } => {
+            print_json(&get(&api, &format!("/balances?trusted={trusted}"))?)
+        }
         CliCommand::Inbox { api } => print_json(&get(&api, "/messages")?),
+        CliCommand::Vouch { api, to } => {
+            print_json(&post(&api, "/vouch", serde_json::json!({"to": to}))?)
+        }
+        CliCommand::Trust { api, depth } => print_json(&get(&api, &format!("/trust?depth={depth}"))?),
+        CliCommand::Name { api, set } => {
+            print_json(&post(&api, "/name", serde_json::json!({"name": set}))?)
+        }
+        CliCommand::JoinFile { api } => {
+            let status = get(&api, "/status")?;
+            let bootstrap: Vec<&str> = status["listen_addrs"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str())
+                        .filter(|s| !s.contains("/127.0.0.1/") && !s.contains("/::1/"))
+                        .collect()
+                })
+                .unwrap_or_default();
+            print_json(&serde_json::json!({
+                "network": status["network"],
+                "bootstrap": bootstrap,
+                "relay": Value::Null,
+            }))
+        }
         CliCommand::Reward { api, to, amount, memo } => print_json(&post(
             &api,
             "/reward",
@@ -199,6 +282,7 @@ async fn run(
     let keypair = identity::load_or_generate(&data_dir)?;
     let peer_id = keypair.public().to_peer_id();
     let wallet = dag::wallet_address(&peer_id);
+    let network_name = config.network.clone();
     println!("network : {}", config.network);
     println!("peer id : {peer_id}");
     println!("wallet  : {wallet}");
@@ -224,6 +308,7 @@ async fn run(
         keypair: Arc::new(keypair),
         peer_id,
         wallet,
+        network: network_name,
     };
     let listener = tokio::net::TcpListener::bind(&api_addr)
         .await

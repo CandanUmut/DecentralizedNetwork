@@ -31,6 +31,7 @@ pub struct AppState {
     pub keypair: Arc<Keypair>,
     pub peer_id: PeerId,
     pub wallet: String,
+    pub network: String,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -42,6 +43,10 @@ pub fn router(state: AppState) -> Router {
         .route("/transactions", get(transactions))
         .route("/balances", get(balances))
         .route("/balance", get(my_balance))
+        .route("/vouch", post(vouch))
+        .route("/trust", get(trust))
+        .route("/names", get(names))
+        .route("/name", post(set_name))
         .route("/reward", post(reward))
         .route("/send", post(send))
         .route("/connect", post(connect))
@@ -109,6 +114,7 @@ async fn status(State(s): State<AppState>) -> Json<Value> {
             .unwrap_or_default()
     };
     Json(json!({
+        "network": s.network,
         "peer_id": s.peer_id.to_string(),
         "wallet": s.wallet,
         "balance": my_balance,
@@ -149,13 +155,84 @@ async fn transactions(State(s): State<AppState>) -> Json<Vec<Value>> {
     )
 }
 
-async fn balances(State(s): State<AppState>) -> Json<Value> {
-    Json(json!(s.dag.lock().unwrap().balances()))
+#[derive(Deserialize)]
+struct TrustQuery {
+    /// When true, count only rewards minted by wallets within `depth` vouch
+    /// hops of this node's wallet.
+    #[serde(default)]
+    trusted: bool,
+    #[serde(default = "default_depth")]
+    depth: u32,
 }
 
-async fn my_balance(State(s): State<AppState>) -> Json<Value> {
-    let balance = s.dag.lock().unwrap().balance(&s.wallet);
-    Json(json!({ "wallet": s.wallet, "balance": balance }))
+fn default_depth() -> u32 {
+    3
+}
+
+async fn balances(State(s): State<AppState>, Query(q): Query<TrustQuery>) -> Json<Value> {
+    let dag = s.dag.lock().unwrap();
+    if q.trusted {
+        let trusted = dag.trusted_set(&s.wallet, q.depth);
+        Json(json!(dag.ledger_view(Some(&trusted)).balances))
+    } else {
+        Json(json!(dag.balances()))
+    }
+}
+
+async fn my_balance(State(s): State<AppState>, Query(q): Query<TrustQuery>) -> Json<Value> {
+    let dag = s.dag.lock().unwrap();
+    let balance = if q.trusted {
+        let trusted = dag.trusted_set(&s.wallet, q.depth);
+        dag.ledger_view(Some(&trusted)).balances.get(&s.wallet).copied().unwrap_or(0)
+    } else {
+        dag.balance(&s.wallet)
+    };
+    Json(json!({ "wallet": s.wallet, "balance": balance, "trusted_view": q.trusted }))
+}
+
+#[derive(Deserialize)]
+struct VouchRequest {
+    /// Wallet (0x…) or peer id being vouched for.
+    to: String,
+}
+
+/// State on the ledger that this node's owner knows and trusts a wallet.
+async fn vouch(
+    State(s): State<AppState>,
+    Json(req): Json<VouchRequest>,
+) -> (StatusCode, Json<Value>) {
+    let receiver = match parse_wallet(&req.to) {
+        Ok(w) => w,
+        Err(e) => return bad(format!("to: {e}")),
+    };
+    if receiver == s.wallet {
+        return bad("cannot vouch for yourself");
+    }
+    submit(&s, TxKind::Vouch, receiver, 0, 0, String::new()).await
+}
+
+/// This node's trust neighborhood: wallets within `depth` vouch hops.
+async fn trust(State(s): State<AppState>, Query(q): Query<TrustQuery>) -> Json<Value> {
+    let trusted = s.dag.lock().unwrap().trusted_set(&s.wallet, q.depth);
+    Json(json!({ "viewer": s.wallet, "depth": q.depth, "trusted": trusted }))
+}
+
+async fn names(State(s): State<AppState>) -> Json<Value> {
+    Json(json!(s.dag.lock().unwrap().names()))
+}
+
+#[derive(Deserialize)]
+struct NameRequest {
+    name: String,
+}
+
+/// Set this wallet's display name (a label, not an identity — names are not
+/// unique and prove nothing).
+async fn set_name(
+    State(s): State<AppState>,
+    Json(req): Json<NameRequest>,
+) -> (StatusCode, Json<Value>) {
+    submit(&s, TxKind::Profile, s.wallet.clone(), 0, 0, req.name).await
 }
 
 #[derive(Deserialize)]

@@ -1,5 +1,28 @@
 # CHANGELOG
 
+## 0.3.0 — 2026-07-03 · A network of people (ROADMAP Stage 3 core)
+
+- **Web of trust:** new `Vouch` transaction — a signed on-ledger statement
+  that you know and trust a wallet (self-vouching invalid). `trust` / `/trust`
+  shows your neighborhood (BFS over vouch edges, `--depth`, default 3).
+  **Trusted balance views** (`balances --trusted`, `/balances?trusted=true`)
+  recompute the ledger counting only rewards minted by wallets within your
+  vouch horizon: a stranger's self-minted fortune is plainly visible in the
+  raw view and worth zero in yours. Verified live: stranger minted 5000 to a
+  wallet; raw view 5100, trusted view 100.
+- **Display names:** `Profile` transaction sets a wallet's name (`name --set`,
+  1–32 printable chars, latest wins). Deliberately non-unique labels — the
+  wallet stays the identity (first-claim uniqueness on a DAG is
+  grind-vulnerable; documented in ROADMAP). Dashboard and API show names.
+- **One-file community join:** `join-file` emits `{network, bootstrap, relay}`
+  from a running node; `run --config file.json` joins from it. Verified live
+  round-trip. `/status` now reports the network name; dashboard shows it and
+  a trusted-balance tile.
+- Mint budgets / rate limits remain an open design problem (self-claimed
+  timestamps vs. deterministic epochs) — recorded honestly in ROADMAP.md
+  rather than faked.
+
+
 ## 0.2.0 — 2026-07-02 · Trustworthy ledger + first services (ROADMAP Stages 1–2)
 
 **Ledger v2** (breaking: new tx format, protocols renamed; start fresh data dirs)
