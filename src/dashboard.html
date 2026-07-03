@@ -39,6 +39,7 @@
 <div id="me"></div>
 <div class="tiles">
   <div class="tile"><b id="balance">–</b><span>my balance</span></div>
+  <div class="tile"><b id="trusted_balance">–</b><span>trusted-view balance</span></div>
   <div class="tile"><b id="peer_count">–</b><span>connected peers</span></div>
   <div class="tile"><b id="tx_count">–</b><span>DAG transactions</span></div>
   <div class="tile"><b id="tip_count">–</b><span>DAG tips</span></div>
@@ -54,11 +55,15 @@ const short = s => s.length > 20 ? s.slice(0, 10) + '…' + s.slice(-6) : s;
 
 async function refresh() {
   try {
-    const [st, bal, txs] = await Promise.all(
-      ['/status', '/balances', '/transactions'].map(u => fetch(u).then(r => r.json())));
+    const [st, bal, txs, names, tbal] = await Promise.all(
+      ['/status', '/balances', '/transactions', '/names', '/balance?trusted=true']
+        .map(u => fetch(u).then(r => r.json())));
+    const label = w => names[w] ? `${names[w]} · ${short(w)}` : short(w);
 
+    $('net').textContent = `· network “${st.network}”`;
     $('me').textContent = `peer ${st.peer_id} · wallet ${st.wallet}`;
     $('balance').textContent = st.balance;
+    $('trusted_balance').textContent = tbal.balance;
     $('peer_count').textContent = st.peer_count;
     $('tx_count').textContent = st.dag_transactions;
     $('tip_count').textContent = st.dag_tips;
@@ -66,12 +71,12 @@ async function refresh() {
 
     $('balances').innerHTML = '<tr><th>wallet</th><th>balance</th></tr>' +
       Object.entries(bal).map(([w, b]) =>
-        `<tr><td><code title="${esc(w)}">${esc(short(w))}${w === st.wallet ? ' (me)' : ''}</code></td><td>${b}</td></tr>`).join('');
+        `<tr><td><code title="${esc(w)}">${esc(label(w))}${w === st.wallet ? ' (me)' : ''}</code></td><td>${b}</td></tr>`).join('');
 
     $('txs').innerHTML = '<tr><th>kind</th><th>from</th><th>to</th><th>amount</th><th>memo</th><th>state</th></tr>' +
       txs.slice(-15).reverse().map(t =>
-        `<tr><td>${esc(t.kind)}</td><td><code title="${esc(t.sender)}">${esc(short(t.sender))}</code></td>` +
-        `<td><code title="${esc(t.receiver)}">${esc(short(t.receiver))}</code></td><td>${t.amount}</td>` +
+        `<tr><td>${esc(t.kind)}</td><td><code title="${esc(t.sender)}">${esc(label(t.sender))}</code></td>` +
+        `<td><code title="${esc(t.receiver)}">${esc(label(t.receiver))}</code></td><td>${t.amount}</td>` +
         `<td>${esc(t.memo || '')}</td>` +
         `<td class="${t.applied ? 'ok' : 'dead'}">${t.applied ? 'applied' : 'not applied'}</td></tr>`).join('');
 
