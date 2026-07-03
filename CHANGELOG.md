@@ -1,5 +1,46 @@
 # CHANGELOG
 
+## 0.2.0 — 2026-07-02 · Trustworthy ledger + first services (ROADMAP Stages 1–2)
+
+**Ledger v2** (breaking: new tx format, protocols renamed; start fresh data dirs)
+- **Attested rewards:** minting to your own wallet is invalid; a reward is a
+  signed statement that *someone else* provided value, with the voucher's
+  wallet on record. `reward` now takes `--to`.
+- **Sequenced transfers + deterministic fold:** transfers carry per-sender
+  sequence numbers; balances are computed by a fixpoint fold that applies
+  transfers in (sender, seq, lowest-hash) order only when funded. Double
+  spends resolve to the same winner on every node; overdrafts from modified
+  clients are structurally accepted but never applied — network-wide
+  balances cannot go negative. `/transactions` now flags `applied`.
+- **Named networks:** `--network <name>` derives distinct genesis, gossip
+  topic, and protocol ids per community.
+- **Delta sync:** peers exchange DAG tips on connect and pull missing
+  ancestry in batched rounds (512 txs/response) instead of full id lists.
+  Orphan pool capped (10k) against memory-exhaustion floods.
+
+**Services (ROADMAP Stage 2)**
+- **Direct messaging** (`/timecoin/<net>/msg/1.0.0`): encrypted,
+  peer-authenticated text messages between connected peers; inbox in
+  `/messages`, CLI `message`/`inbox`. Peer addresses learned from identify
+  so a once-met peer can be redialed.
+- **Paid blob storage** (`/timecoin/<net>/blob/1.0.0`): quote → pay on the
+  ledger → store → fetch. Providers verify the payment transaction is a
+  transfer to their wallet, of at least the quoted price, **applied** by the
+  ledger fold (a double-spend loser can't buy storage), and never redeemed
+  before (redemptions persisted). Content fetched is hash-verified by the
+  client. `--blob-price` / `--blob-max-kib`; price 0 = store for free.
+- **Dashboard:** `GET /` serves a live HTML dashboard (peers, tips,
+  balances, transaction feed with applied state).
+- ROADMAP.md: the staged plan from here to the shared compute/storage
+  vision, including what is deliberately not built yet and why.
+
+**Verified live:** 3 nodes + late joiner converge (attested reward,
+transfer, storage payment; identical balances everywhere); self-mint
+rejected over the API; message delivery both ways; paid store/fetch with
+the provider earning 1 TC; restart keeps identity, ledger, and redeemed
+payments; relay demo still green.
+
+
 ## 0.1.0 — 2026-07-02 · Revival: fork removed, MVP node rebuilt
 
 **Phase 0 — inventory (no code changes)**
