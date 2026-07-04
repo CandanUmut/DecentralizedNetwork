@@ -3,8 +3,10 @@
 > **Historical note:** this documents the scope of the initial revival (v0.1.0).
 > Several deferrals below have since shipped in v0.2.0 — attested minting,
 > network-wide overdraft immunity, deterministic double-spend resolution, paid
-> blob storage, and direct messaging. See ROADMAP.md for the current state and
-> CHANGELOG.md for what changed.
+> blob storage, and direct messaging — plus the web of trust and the
+> daily-allowance economy. See [../ROADMAP.md](../ROADMAP.md) for the current
+> state and the repo-root CHANGELOG.md for what changed. The `legacy/` source
+> mentioned below lives at the git tag **`legacy-source`**.
 
 This MVP exists to prove one thing end to end: **N nodes on current upstream libp2p
 discover each other, gossip signed TimeCoin contribution records into a shared DAG, and

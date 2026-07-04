@@ -1,7 +1,7 @@
 //! The TimeCoin DAG ("tangle"): contribution records attach to current tips,
 //! are validated, and balances are derived by folding over the whole DAG.
 //!
-//! v2 ledger rules (see ROADMAP.md, Stage 1):
+//! v2 ledger rules (see docs/ROADMAP.md, Stage 1):
 //! - Rewards are *attestations*: the signer vouches that someone else provided
 //!   value. A reward whose signer is its own recipient is invalid — you cannot
 //!   mint to yourself. The minter's wallet is recorded, so every coin's origin
