@@ -1,5 +1,48 @@
 # CHANGELOG
 
+## 0.5.0 — 2026-07-04 · A real economy, a real invitation, a human face
+
+(Breaking: economy rules are part of genesis now — start fresh data dirs.)
+
+**The economy (user feedback: "this should mean something for the community")**
+- **Daily giving allowance:** each member's thanks can create at most
+  `--daily-allowance` TC per day (default 100), baked into genesis so it is
+  part of the community's identity and enforced identically by every node's
+  ledger fold. Verified live: an over-allowance thank is refused with the
+  remaining budget ("you can still give 20 of 100 TC today"), and even a
+  client that skips that check mints coin that counts for zero everywhere.
+- **Timestamp discipline** makes the allowance real: time must flow forward
+  along the DAG (a transaction may not predate its parents), future-dated
+  transactions are parked until their claimed time arrives (no pre-farming
+  tomorrow), and in trusted views a member's rewards count only from their
+  first trusted vouch (no arriving with a backdated history). The remaining
+  back-fill edge for one's own unused past days is documented in README and
+  ROADMAP rather than hidden.
+- `/allowance` endpoint + a giving meter in the app.
+
+**The invitation (user feedback: "the QR searched Google for ip4")**
+- New read-only **invite listener** (`--invite`, default 0.0.0.0:3080,
+  non-fatal if the port is taken): serves a human invite page — what this
+  is, why it's different, 3 steps to join — plus the downloadable join file
+  and the QR. **The QR now encodes the invite page URL**, so scanning opens
+  a real page. Join files (and `join-file`/`/join.json`) now carry the
+  economy parameters, so a friend's node adopts the community's rules
+  automatically.
+
+**The face (user feedback: "I still see peer ids instead of usernames")**
+- `/peers` now returns people ({peer_id, wallet, name}); Chat and the peers
+  list show names everywhere. Join tab explains the flow in words; a
+  "What is this?" card summarizes the vision in-app.
+- New `VISION.md`: the full story — the problem, the three ideas
+  (gratitude-minted coin, revocable web of trust, member-to-member
+  services), why decentralization specifically, what it could become, and
+  what this project will not do.
+
+**Seamlessness**
+- Nodes that find themselves alone now **redial their bootstrap peers every
+  30 s** — verified live across a peer restart (reconnects without help).
+
+
 ## 0.4.0 — 2026-07-04 · Trust-gated economy, DHT, custody checks, phone UI
 
 **Mint security & trust (user-requested hardening)**

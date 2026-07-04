@@ -23,6 +23,28 @@ use std::path::{Path, PathBuf};
 /// missing, so a malicious peer can't exhaust memory with orphans.
 const MAX_ORPHANS: usize = 10_000;
 
+/// Clock skew tolerated before a transaction is considered future-dated and
+/// parked until its time arrives.
+const FUTURE_SKEW_SECS: u64 = 300;
+
+const SECS_PER_DAY: u64 = 86_400;
+
+/// Community economy parameters. They are baked into the genesis
+/// transactions, so every node of a community enforces the same rules —
+/// and different rules mean a different (disjoint) network by construction.
+#[derive(Debug, Clone)]
+pub struct Params {
+    pub network: String,
+    /// How much TimeCoin any one member's *thanks* can create per day.
+    /// The scarcity that makes the coin mean something. 0 = unlimited
+    /// (useful for tests and toy networks).
+    pub daily_allowance: u64,
+}
+
+pub fn day_of(timestamp: u64) -> u64 {
+    timestamp / SECS_PER_DAY
+}
+
 /// Derive a wallet address from a peer id, exactly as the legacy code did:
 /// `0x` + hex(sha256(base58 peer id)).
 pub fn wallet_address(peer_id: &libp2p::PeerId) -> String {
@@ -259,11 +281,12 @@ impl Transaction {
     }
 }
 
-/// The two genesis transactions every node of a named network computes
-/// identically, so all DAGs of that network share the same roots — and DAGs
-/// of *different* networks share nothing.
-pub fn genesis(network: &str) -> Vec<Transaction> {
-    let memo = format!("genesis:{network}");
+/// The two genesis transactions every node of a community computes
+/// identically, so all DAGs of that community share the same roots — and
+/// communities with different names *or different economy rules* share
+/// nothing by construction.
+pub fn genesis(params: &Params) -> Vec<Transaction> {
+    let memo = format!("genesis:{}:allowance={}", params.network, params.daily_allowance);
     let g = |receiver: &str, parents: Vec<String>| {
         let mut tx = Transaction {
             id: String::new(),
@@ -291,50 +314,60 @@ pub fn genesis(network: &str) -> Vec<Transaction> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LedgerState {
     pub balances: BTreeMap<String, i64>,
-    /// Ids of transfers applied by the fold. Rewards always apply.
+    /// Ids of transfers applied by the fold.
     pub applied_transfers: HashSet<String>,
+    /// Ids of rewards that counted (within allowance/caps/trust).
+    pub counted_rewards: HashSet<String>,
 }
 
 /// In-memory DAG with append-only on-disk persistence (JSON lines).
 pub struct Dag {
-    network: String,
+    params: Params,
     transactions: HashMap<String, Transaction>,
     /// Ids referenced as a parent by at least one accepted transaction.
     referenced: HashSet<String>,
     /// Valid transactions waiting for missing parents, by missing parent id.
     orphans: HashMap<String, Vec<Transaction>>,
     orphan_count: usize,
+    /// Future-dated transactions parked until their claimed time arrives —
+    /// you cannot pre-farm tomorrow's allowance today.
+    parked: Vec<Transaction>,
     log_path: Option<PathBuf>,
 }
 
 impl Dag {
-    pub fn new(network: &str) -> Self {
+    pub fn new(params: &Params) -> Self {
         let mut dag = Self {
-            network: network.to_string(),
+            params: params.clone(),
             transactions: HashMap::new(),
             referenced: HashSet::new(),
             orphans: HashMap::new(),
             orphan_count: 0,
+            parked: Vec::new(),
             log_path: None,
         };
-        for g in genesis(network) {
+        for g in genesis(params) {
             dag.accept(g);
         }
         dag
     }
 
+    pub fn params(&self) -> &Params {
+        &self.params
+    }
+
     /// Load from `dir/dag.jsonl`, creating a fresh DAG (genesis only) if the
     /// file doesn't exist. Every stored transaction is re-validated on load.
-    pub fn load(dir: &Path, network: &str) -> Result<Self> {
-        let mut dag = Self::new(network);
+    pub fn load(dir: &Path, params: &Params) -> Result<Self> {
+        let mut dag = Self::new(params);
         let path = dir.join("dag.jsonl");
         if path.exists() {
             let data = std::fs::read_to_string(&path)
                 .with_context(|| format!("reading {}", path.display()))?;
             for line in data.lines().filter(|l| !l.trim().is_empty()) {
                 let tx: Transaction = serde_json::from_str(line).context("corrupt dag.jsonl line")?;
-                // Genesis rows are already present; skip duplicates silently.
-                if let Err(e) = dag.insert(tx.clone()) {
+                // Stored transactions were accepted before; don't re-park.
+                if let Err(e) = dag.insert(tx.clone(), u64::MAX) {
                     if !dag.contains(&tx.id) {
                         tracing::warn!("dropping invalid stored transaction {}: {e}", tx.id);
                     }
@@ -420,19 +453,31 @@ impl Dag {
         }
     }
 
-    /// Insert a transaction (local or from the network).
+    /// Insert a transaction (local or from the network). `now` is the local
+    /// clock in unix seconds.
     ///
     /// Returns `Ok(newly_accepted)`: the transaction itself plus any orphans
     /// it unblocked. A structurally valid transaction with unknown parents is
-    /// parked as an orphan and returns an empty vec.
-    pub fn insert(&mut self, tx: Transaction) -> Result<Vec<Transaction>> {
+    /// parked as an orphan; a future-dated one is parked until its claimed
+    /// time arrives (see [`Dag::release_due`]). Both return an empty vec.
+    pub fn insert(&mut self, tx: Transaction, now: u64) -> Result<Vec<Transaction>> {
         if self.contains(&tx.id) {
             return Ok(vec![]);
         }
         if !tx.is_genesis() {
             tx.validate()?;
-        } else if !genesis(&self.network).iter().any(|g| g.id == tx.id) {
-            bail!("unknown genesis transaction (different --network?)");
+        } else if !genesis(&self.params).iter().any(|g| g.id == tx.id) {
+            bail!("unknown genesis transaction (different --network or economy rules?)");
+        }
+
+        // A claimed future time would let someone farm tomorrow's allowance
+        // today; park it until the network's clocks agree it exists.
+        if tx.timestamp > now.saturating_add(FUTURE_SKEW_SECS) {
+            if self.parked.len() >= MAX_ORPHANS {
+                bail!("future-dated pool full");
+            }
+            self.parked.push(tx);
+            return Ok(vec![]);
         }
 
         if let Some(missing) = tx.parents.iter().find(|p| !self.contains(p)) {
@@ -443,6 +488,7 @@ impl Dag {
             self.orphans.entry(missing.clone()).or_default().push(tx);
             return Ok(vec![]);
         }
+        self.check_parent_times(&tx)?;
 
         let mut accepted = vec![tx.clone()];
         self.accept(tx);
@@ -460,7 +506,7 @@ impl Dag {
                     let missing = missing.clone();
                     self.orphan_count += 1;
                     self.orphans.entry(missing).or_default().push(w);
-                } else {
+                } else if self.check_parent_times(&w).is_ok() {
                     queue.push(w.id.clone());
                     accepted.push(w.clone());
                     self.accept(w);
@@ -468,6 +514,41 @@ impl Dag {
             }
         }
         Ok(accepted)
+    }
+
+    /// Time flows forward along the DAG: a transaction may not claim a time
+    /// earlier than any of its parents. Blocks trivial backdating.
+    fn check_parent_times(&self, tx: &Transaction) -> Result<()> {
+        let max_parent_ts = tx
+            .parents
+            .iter()
+            .filter_map(|p| self.transactions.get(p))
+            .map(|p| p.timestamp)
+            .max()
+            .unwrap_or(0);
+        if tx.timestamp < max_parent_ts {
+            bail!("timestamp earlier than a parent's — time flows forward along the DAG");
+        }
+        Ok(())
+    }
+
+    /// Accept parked future-dated transactions whose time has arrived.
+    /// Returns the newly accepted transactions.
+    pub fn release_due(&mut self, now: u64) -> Vec<Transaction> {
+        let due: Vec<Transaction> = {
+            let (due, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut self.parked)
+                .into_iter()
+                .partition(|tx| tx.timestamp <= now.saturating_add(FUTURE_SKEW_SECS));
+            self.parked = keep;
+            due
+        };
+        let mut accepted = Vec::new();
+        for tx in due {
+            if let Ok(mut a) = self.insert(tx, now) {
+                accepted.append(&mut a);
+            }
+        }
+        accepted
     }
 
     /// Deterministic ledger fold — a pure function of the transaction *set*,
@@ -493,35 +574,81 @@ impl Dag {
     /// `mint_cap` > 0 additionally limits how much total mint any single
     /// attester's rewards contribute (blast-radius limit for a compromised
     /// or colluding vouched wallet); rewards are considered in (timestamp,
-    /// id) order so the cap is a pure function of the set. Transfers behave
-    /// identically; they just can't be funded by uncounted mints.
+    /// id) order so every rule below is a pure function of the set.
+    ///
+    /// Community economy (always on, raw and trusted views alike): each
+    /// attester's rewards count only up to `daily_allowance` TC per claimed
+    /// day. Combined with parent-time monotonicity and future-parking at
+    /// insert, thanks-per-day is the scarcity of the coin.
+    ///
+    /// In trusted views a member's rewards additionally count only from the
+    /// moment a trusted wallet first vouched for them — a newcomer cannot
+    /// arrive with a "backdated history" of self-assigned generosity.
     pub fn ledger_view(&self, trusted: Option<&BTreeMap<String, u32>>, mint_cap: u64) -> LedgerState {
         let mut balances: BTreeMap<String, i64> = BTreeMap::new();
+        let mut counted_rewards: HashSet<String> = HashSet::new();
         let mut rewards: Vec<&Transaction> = self
             .transactions
             .values()
             .filter(|t| t.kind == TxKind::Reward)
             .collect();
         rewards.sort_by(|a, b| (a.timestamp, &a.id).cmp(&(b.timestamp, &b.id)));
+
+        // Membership anchor for trusted views: earliest vouch for a wallet
+        // by anyone in the trusted set.
+        let anchors: HashMap<&str, u64> = match trusted {
+            None => HashMap::new(),
+            Some(set) => {
+                let mut anchors: HashMap<&str, u64> = HashMap::new();
+                for tx in self.transactions.values().filter(|t| t.kind == TxKind::Vouch) {
+                    if set.contains_key(&tx.sender) {
+                        anchors
+                            .entry(tx.receiver.as_str())
+                            .and_modify(|t| *t = (*t).min(tx.timestamp))
+                            .or_insert(tx.timestamp);
+                    }
+                }
+                anchors
+            }
+        };
+
         let mut minted_by: HashMap<&str, u64> = HashMap::new();
+        let mut minted_by_day: HashMap<(&str, u64), u64> = HashMap::new();
         for tx in rewards {
             // Genesis marker: an empty public key is only insertable when the
             // id matches the network's known genesis transactions.
             let genesis = tx.public_key.is_empty();
-            let counted = match trusted {
-                None => true,
-                Some(set) => genesis || set.contains_key(&tx.sender),
-            };
-            if !counted {
-                continue;
-            }
-            if mint_cap > 0 && !genesis {
-                let so_far = minted_by.entry(tx.sender.as_str()).or_default();
-                if *so_far + tx.amount > mint_cap {
+            if let Some(set) = trusted {
+                if !genesis && !set.contains_key(&tx.sender) {
                     continue;
                 }
-                *so_far += tx.amount;
+                // Viewer (depth 0) is anchored at 0; others at first vouch.
+                if !genesis && set.get(&tx.sender) != Some(&0) {
+                    match anchors.get(tx.sender.as_str()) {
+                        Some(anchor) if tx.timestamp >= *anchor => {}
+                        _ => continue,
+                    }
+                }
             }
+            if !genesis {
+                if self.params.daily_allowance > 0 {
+                    let day = minted_by_day
+                        .entry((tx.sender.as_str(), day_of(tx.timestamp)))
+                        .or_default();
+                    if *day + tx.amount > self.params.daily_allowance {
+                        continue;
+                    }
+                    *day += tx.amount;
+                }
+                if mint_cap > 0 {
+                    let so_far = minted_by.entry(tx.sender.as_str()).or_default();
+                    if *so_far + tx.amount > mint_cap {
+                        continue;
+                    }
+                    *so_far += tx.amount;
+                }
+            }
+            counted_rewards.insert(tx.id.clone());
             *balances.entry(tx.receiver.clone()).or_default() += tx.amount as i64;
         }
 
@@ -562,7 +689,23 @@ impl Dag {
                 break;
             }
         }
-        LedgerState { balances, applied_transfers: applied }
+        LedgerState { balances, applied_transfers: applied, counted_rewards }
+    }
+
+    /// How much of today's giving allowance a wallet has used (counted
+    /// rewards it attested with today's date).
+    pub fn given_on_day(&self, wallet: &str, day: u64) -> u64 {
+        let counted = self.ledger().counted_rewards;
+        self.transactions
+            .values()
+            .filter(|t| {
+                t.kind == TxKind::Reward
+                    && t.sender == wallet
+                    && day_of(t.timestamp) == day
+                    && counted.contains(&t.id)
+            })
+            .map(|t| t.amount)
+            .sum()
     }
 
     pub fn balances(&self) -> BTreeMap<String, i64> {
@@ -652,7 +795,11 @@ fn append_line(path: &Path, tx: &Transaction) -> Result<()> {
 mod tests {
     use super::*;
 
-    const NET: &str = "test";
+    const NOW: u64 = 1_800_000_000;
+
+    fn params(daily_allowance: u64) -> Params {
+        Params { network: "test".into(), daily_allowance }
+    }
 
     fn keypair() -> Keypair {
         Keypair::generate_ed25519()
@@ -673,7 +820,7 @@ mod tests {
             0,
             "test contribution".into(),
             dag.tips(),
-            1,
+            10,
         )
         .unwrap()
     }
@@ -694,16 +841,16 @@ mod tests {
             seq,
             String::new(),
             dag.tips(),
-            2,
+            20,
         )
         .unwrap()
     }
 
     #[test]
     fn genesis_is_deterministic_and_network_scoped() {
-        let a = genesis("main").iter().map(|g| g.id.clone()).collect::<Vec<_>>();
-        let b = genesis("main").iter().map(|g| g.id.clone()).collect::<Vec<_>>();
-        let c = genesis("koop").iter().map(|g| g.id.clone()).collect::<Vec<_>>();
+        let a = genesis(&Params { network: "main".into(), daily_allowance: 100 }).iter().map(|g| g.id.clone()).collect::<Vec<_>>();
+        let b = genesis(&Params { network: "main".into(), daily_allowance: 100 }).iter().map(|g| g.id.clone()).collect::<Vec<_>>();
+        let c = genesis(&Params { network: "koop".into(), daily_allowance: 100 }).iter().map(|g| g.id.clone()).collect::<Vec<_>>();
         assert_eq!(a, b);
         assert_ne!(a, c);
     }
@@ -711,25 +858,25 @@ mod tests {
     #[test]
     fn cannot_mint_to_yourself() {
         let key = keypair();
-        let dag = Dag::new(NET);
+        let dag = Dag::new(&params(0));
         let selfish = reward_to(&dag, &key, &wallet_of(&key), 1000);
         assert!(selfish.validate().is_err());
         let mut dag = dag;
-        assert!(dag.insert(selfish).is_err());
+        assert!(dag.insert(selfish, NOW).is_err());
     }
 
     #[test]
     fn attested_reward_then_transfer_updates_balances() {
         let alice = keypair();
         let bob = keypair();
-        let mut dag = Dag::new(NET);
+        let mut dag = Dag::new(&params(0));
 
         // Bob attests Alice contributed.
-        dag.insert(reward_to(&dag, &bob, &wallet_of(&alice), 100)).unwrap();
+        dag.insert(reward_to(&dag, &bob, &wallet_of(&alice), 100), NOW).unwrap();
         assert_eq!(dag.balance(&wallet_of(&alice)), 100);
 
         // Alice pays Bob 40.
-        dag.insert(transfer(&dag, &alice, &wallet_of(&bob), 40, 0)).unwrap();
+        dag.insert(transfer(&dag, &alice, &wallet_of(&bob), 40, 0), NOW).unwrap();
         assert_eq!(dag.balance(&wallet_of(&alice)), 60);
         assert_eq!(dag.balance(&wallet_of(&bob)), 40);
     }
@@ -737,7 +884,7 @@ mod tests {
     #[test]
     fn transfer_must_be_signed_by_sender() {
         let key = keypair();
-        let dag = Dag::new(NET);
+        let dag = Dag::new(&params(0));
         let t = Transaction::create(
             TxKind::Transfer,
             &key,
@@ -747,7 +894,7 @@ mod tests {
             0,
             String::new(),
             dag.tips(),
-            2,
+            20,
         )
         .unwrap();
         assert!(t.validate().is_err());
@@ -756,7 +903,7 @@ mod tests {
     #[test]
     fn tampered_amount_fails_validation() {
         let key = keypair();
-        let dag = Dag::new(NET);
+        let dag = Dag::new(&params(0));
         let mut r = reward_to(&dag, &key, "0xw", 10);
         r.amount = 1000;
         assert!(r.validate().is_err());
@@ -766,12 +913,12 @@ mod tests {
     fn overdraft_never_applies_network_wide() {
         let alice = keypair();
         let bob = keypair();
-        let mut dag = Dag::new(NET);
-        dag.insert(reward_to(&dag, &bob, &wallet_of(&alice), 10)).unwrap();
+        let mut dag = Dag::new(&params(0));
+        dag.insert(reward_to(&dag, &bob, &wallet_of(&alice), 10), NOW).unwrap();
 
         // A modified client signs a structurally valid transfer of 1000.
         let overdraft = transfer(&dag, &alice, &wallet_of(&bob), 1000, 0);
-        dag.insert(overdraft.clone()).unwrap(); // accepted into the DAG…
+        dag.insert(overdraft.clone(), NOW).unwrap(); // accepted into the DAG…
 
         let ledger = dag.ledger();
         assert!(!ledger.applied_transfers.contains(&overdraft.id)); // …but never applied
@@ -783,26 +930,26 @@ mod tests {
     fn double_spend_resolves_identically_regardless_of_arrival_order() {
         let alice = keypair();
         let bob = keypair();
-        let mut base = Dag::new(NET);
-        base.insert(reward_to(&base, &bob, &wallet_of(&alice), 100)).unwrap();
+        let mut base = Dag::new(&params(0));
+        base.insert(reward_to(&base, &bob, &wallet_of(&alice), 100), NOW).unwrap();
 
         // Alice signs two conflicting seq-0 transfers spending the same 100.
         let spend_x = transfer(&base, &alice, "0xmerchant_x", 100, 0);
         let spend_y = transfer(&base, &alice, "0xmerchant_y", 100, 0);
 
-        let mut a = Dag::new(NET);
+        let mut a = Dag::new(&params(0));
         for tx in base.all().cloned().collect::<Vec<_>>() {
-            let _ = a.insert(tx);
+            let _ = a.insert(tx, NOW);
         }
-        let mut b = Dag::new(NET);
+        let mut b = Dag::new(&params(0));
         for tx in base.all().cloned().collect::<Vec<_>>() {
-            let _ = b.insert(tx);
+            let _ = b.insert(tx, NOW);
         }
 
-        a.insert(spend_x.clone()).unwrap();
-        a.insert(spend_y.clone()).unwrap();
-        b.insert(spend_y.clone()).unwrap();
-        b.insert(spend_x.clone()).unwrap();
+        a.insert(spend_x.clone(), NOW).unwrap();
+        a.insert(spend_y.clone(), NOW).unwrap();
+        b.insert(spend_y.clone(), NOW).unwrap();
+        b.insert(spend_x.clone(), NOW).unwrap();
 
         assert_eq!(a.balances(), b.balances());
         let winner = if spend_x.id < spend_y.id { &spend_x } else { &spend_y };
@@ -820,11 +967,11 @@ mod tests {
         let bob = keypair();
         let carol = keypair();
         let attester = keypair();
-        let mut dag = Dag::new(NET);
+        let mut dag = Dag::new(&params(0));
         // attester funds alice; alice pays bob; bob pays carol.
-        dag.insert(reward_to(&dag, &attester, &wallet_of(&alice), 50)).unwrap();
-        dag.insert(transfer(&dag, &alice, &wallet_of(&bob), 50, 0)).unwrap();
-        dag.insert(transfer(&dag, &bob, &wallet_of(&carol), 30, 0)).unwrap();
+        dag.insert(reward_to(&dag, &attester, &wallet_of(&alice), 50), NOW).unwrap();
+        dag.insert(transfer(&dag, &alice, &wallet_of(&bob), 50, 0), NOW).unwrap();
+        dag.insert(transfer(&dag, &bob, &wallet_of(&carol), 30, 0), NOW).unwrap();
 
         assert_eq!(dag.balance(&wallet_of(&alice)), 0);
         assert_eq!(dag.balance(&wallet_of(&bob)), 20);
@@ -841,7 +988,7 @@ mod tests {
             0,
             String::new(),
             dag.tips(),
-            3,
+            5,
         )
         .unwrap()
     }
@@ -849,7 +996,7 @@ mod tests {
     #[test]
     fn cannot_vouch_for_yourself() {
         let key = keypair();
-        let dag = Dag::new(NET);
+        let dag = Dag::new(&params(0));
         let v = vouch(&dag, &key, &wallet_of(&key));
         assert!(v.validate().is_err());
     }
@@ -859,9 +1006,9 @@ mod tests {
         let a = keypair();
         let b = keypair();
         let c = keypair();
-        let mut dag = Dag::new(NET);
-        dag.insert(vouch(&dag, &a, &wallet_of(&b))).unwrap(); // a → b
-        dag.insert(vouch(&dag, &b, &wallet_of(&c))).unwrap(); // b → c
+        let mut dag = Dag::new(&params(0));
+        dag.insert(vouch(&dag, &a, &wallet_of(&b)), NOW).unwrap(); // a → b
+        dag.insert(vouch(&dag, &b, &wallet_of(&c)), NOW).unwrap(); // b → c
 
         let depth1 = dag.trusted_set(&wallet_of(&a), 1);
         assert!(depth1.contains_key(&wallet_of(&b)));
@@ -879,11 +1026,11 @@ mod tests {
         let friend = keypair();
         let stranger = keypair();
         let worker = keypair();
-        let mut dag = Dag::new(NET);
-        dag.insert(vouch(&dag, &me, &wallet_of(&friend))).unwrap();
+        let mut dag = Dag::new(&params(0));
+        dag.insert(vouch(&dag, &me, &wallet_of(&friend)), NOW).unwrap();
         // Friend (trusted) mints 10 to worker; stranger mints 1000 to worker.
-        dag.insert(reward_to(&dag, &friend, &wallet_of(&worker), 10)).unwrap();
-        dag.insert(reward_to(&dag, &stranger, &wallet_of(&worker), 1000)).unwrap();
+        dag.insert(reward_to(&dag, &friend, &wallet_of(&worker), 10), NOW).unwrap();
+        dag.insert(reward_to(&dag, &stranger, &wallet_of(&worker), 1000), NOW).unwrap();
 
         assert_eq!(dag.balance(&wallet_of(&worker)), 1010); // raw view
         let trusted = dag.trusted_set(&wallet_of(&me), 3);
@@ -896,9 +1043,9 @@ mod tests {
         let me = keypair();
         let friend = keypair();
         let their_friend = keypair();
-        let mut dag = Dag::new(NET);
-        dag.insert(vouch(&dag, &me, &wallet_of(&friend))).unwrap();
-        dag.insert(vouch(&dag, &friend, &wallet_of(&their_friend))).unwrap();
+        let mut dag = Dag::new(&params(0));
+        dag.insert(vouch(&dag, &me, &wallet_of(&friend)), NOW).unwrap();
+        dag.insert(vouch(&dag, &friend, &wallet_of(&their_friend)), NOW).unwrap();
         assert!(dag.trusted_set(&wallet_of(&me), 3).contains_key(&wallet_of(&their_friend)));
 
         // I withdraw my vouch (later timestamp wins).
@@ -914,7 +1061,7 @@ mod tests {
             99,
         )
         .unwrap();
-        dag.insert(revoke).unwrap();
+        dag.insert(revoke, NOW).unwrap();
         let trusted = dag.trusted_set(&wallet_of(&me), 3);
         assert!(!trusted.contains_key(&wallet_of(&friend)));
         assert!(!trusted.contains_key(&wallet_of(&their_friend)));
@@ -925,8 +1072,8 @@ mod tests {
     fn mint_cap_limits_a_single_attesters_blast_radius() {
         let me = keypair();
         let friend = keypair();
-        let mut dag = Dag::new(NET);
-        dag.insert(vouch(&dag, &me, &wallet_of(&friend))).unwrap();
+        let mut dag = Dag::new(&params(0));
+        dag.insert(vouch(&dag, &me, &wallet_of(&friend)), NOW).unwrap();
         // Trusted friend goes rogue and mints 3 × 400 to an accomplice.
         for ts in [10, 20, 30] {
             let tx = Transaction::create(
@@ -941,7 +1088,7 @@ mod tests {
                 ts,
             )
             .unwrap();
-            dag.insert(tx).unwrap();
+            dag.insert(tx, NOW).unwrap();
         }
         let trusted = dag.trusted_set(&wallet_of(&me), 3);
         // Uncapped trusted view counts all 1200.
@@ -959,7 +1106,7 @@ mod tests {
     #[test]
     fn profile_latest_name_wins_and_is_validated() {
         let key = keypair();
-        let mut dag = Dag::new(NET);
+        let mut dag = Dag::new(&params(0));
         let name = |dag: &Dag, text: &str, ts: u64| {
             Transaction::create(
                 TxKind::Profile,
@@ -974,8 +1121,8 @@ mod tests {
             )
             .unwrap()
         };
-        dag.insert(name(&dag, "umut", 10)).unwrap();
-        dag.insert(name(&dag, "umut-v2", 20)).unwrap();
+        dag.insert(name(&dag, "umut", 10), NOW).unwrap();
+        dag.insert(name(&dag, "umut-v2", 20), NOW).unwrap();
         assert_eq!(dag.names().get(&wallet_of(&key)).map(String::as_str), Some("umut-v2"));
 
         let too_long = name(&dag, &"x".repeat(33), 30);
@@ -985,18 +1132,18 @@ mod tests {
     #[test]
     fn orphans_resolve_when_parent_arrives() {
         let attester = keypair();
-        let mut a = Dag::new(NET);
+        let mut a = Dag::new(&params(0));
         let r1 = reward_to(&a, &attester, "0xw", 10);
-        a.insert(r1.clone()).unwrap();
+        a.insert(r1.clone(), NOW).unwrap();
         let r2 = reward_to(&a, &attester, "0xw", 20); // parents include r1
-        a.insert(r2.clone()).unwrap();
+        a.insert(r2.clone(), NOW).unwrap();
 
         // Node B receives child before parent.
-        let mut b = Dag::new(NET);
-        assert!(b.insert(r2.clone()).unwrap().is_empty());
+        let mut b = Dag::new(&params(0));
+        assert!(b.insert(r2.clone(), NOW).unwrap().is_empty());
         assert!(!b.contains(&r2.id));
         assert_eq!(b.missing_parents(), vec![r1.id.clone()]);
-        let accepted = b.insert(r1.clone()).unwrap();
+        let accepted = b.insert(r1.clone(), NOW).unwrap();
         assert_eq!(accepted.len(), 2);
         assert!(b.contains(&r2.id));
         assert_eq!(b.tips(), a.tips());
@@ -1006,14 +1153,89 @@ mod tests {
     #[test]
     fn with_ancestry_returns_reachable_history() {
         let attester = keypair();
-        let mut dag = Dag::new(NET);
+        let mut dag = Dag::new(&params(0));
         let r1 = reward_to(&dag, &attester, "0xw", 10);
-        dag.insert(r1).unwrap();
+        dag.insert(r1, NOW).unwrap();
         let r2 = reward_to(&dag, &attester, "0xw", 20);
-        dag.insert(r2.clone()).unwrap();
+        dag.insert(r2.clone(), NOW).unwrap();
         // From the single tip, ancestry reaches everything.
         let txs = dag.with_ancestry(&[r2.id.clone()], 100);
         assert_eq!(txs.len(), dag.len());
+    }
+
+    #[test]
+    fn daily_allowance_caps_minting_per_attester_per_day() {
+        let a = keypair();
+        let mut dag = Dag::new(&params(50)); // 50 TC/day community
+        let day1 = SECS_PER_DAY + 10;
+        let mint = |dag: &Dag, ts: u64, amount: u64| {
+            Transaction::create(
+                TxKind::Reward, &a, wallet_of(&a), "0xw".into(), amount, 0,
+                "thanks".into(), dag.tips(), ts,
+            ).unwrap()
+        };
+        dag.insert(mint(&dag, 10, 30), NOW).unwrap();
+        dag.insert(mint(&dag, 20, 30), NOW).unwrap(); // over budget: 60 > 50
+        assert_eq!(dag.balance("0xw"), 30); // second reward doesn't count
+        dag.insert(mint(&dag, day1, 30), NOW).unwrap(); // next day: fresh budget
+        assert_eq!(dag.balance("0xw"), 60);
+        // The uncounted reward is in the DAG (visible) but worth nothing.
+        assert_eq!(dag.ledger().counted_rewards.len(), 2 + 2); // 2 genesis + 2 counted
+    }
+
+    #[test]
+    fn future_dated_transactions_park_until_due() {
+        let a = keypair();
+        let mut dag = Dag::new(&params(0));
+        let future = NOW + 7 * SECS_PER_DAY;
+        let tx = Transaction::create(
+            TxKind::Reward, &a, wallet_of(&a), "0xw".into(), 10, 0,
+            "from the future".into(), dag.tips(), future,
+        ).unwrap();
+        assert!(dag.insert(tx.clone(), NOW).unwrap().is_empty());
+        assert!(!dag.contains(&tx.id)); // parked, not accepted
+        assert!(dag.release_due(NOW).is_empty()); // still not due
+        let released = dag.release_due(future + 1);
+        assert_eq!(released.len(), 1);
+        assert!(dag.contains(&tx.id));
+    }
+
+    #[test]
+    fn timestamps_flow_forward_along_the_dag() {
+        let a = keypair();
+        let mut dag = Dag::new(&params(0));
+        dag.insert(reward_to(&dag, &a, "0xw", 10), NOW).unwrap(); // ts 10
+        let backdated = Transaction::create(
+            TxKind::Reward, &a, wallet_of(&a), "0xw".into(), 10, 0,
+            "backdated".into(), dag.tips(), 5, // earlier than its parent (10)
+        ).unwrap();
+        assert!(dag.insert(backdated, NOW).is_err());
+    }
+
+    #[test]
+    fn trusted_view_ignores_rewards_predating_membership() {
+        let me = keypair();
+        let newcomer = keypair();
+        let mut dag = Dag::new(&params(0));
+        // Newcomer arrives with a self-made "history" of generosity (ts 10),
+        // then gets vouched in at ts 50.
+        dag.insert(reward_to(&dag, &newcomer, "0xcrony", 500), NOW).unwrap(); // ts 10
+        let vouch_late = Transaction::create(
+            TxKind::Vouch, &me, wallet_of(&me), wallet_of(&newcomer), 0, 0,
+            String::new(), dag.tips(), 50,
+        ).unwrap();
+        dag.insert(vouch_late, NOW).unwrap();
+        let after = Transaction::create(
+            TxKind::Reward, &newcomer, wallet_of(&newcomer), "0xcrony".into(), 20, 0,
+            "real".into(), dag.tips(), 60,
+        ).unwrap();
+        dag.insert(after, NOW).unwrap();
+
+        let trusted = dag.trusted_set(&wallet_of(&me), 3);
+        let view = dag.ledger_view(Some(&trusted), 0);
+        // Only the reward made *after* membership counts in my view.
+        assert_eq!(view.balances.get("0xcrony"), Some(&20));
+        assert_eq!(dag.balance("0xcrony"), 520); // raw view still shows all
     }
 
     #[test]
@@ -1023,11 +1245,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let attester = keypair();
         {
-            let mut dag = Dag::load(&dir, NET).unwrap();
+            let mut dag = Dag::load(&dir, &params(0)).unwrap();
             let r = reward_to(&dag, &attester, "0xw", 10);
-            dag.insert(r).unwrap();
+            dag.insert(r, NOW).unwrap();
         }
-        let dag = Dag::load(&dir, NET).unwrap();
+        let dag = Dag::load(&dir, &params(0)).unwrap();
         assert_eq!(dag.balance("0xw"), 10);
         assert_eq!(dag.len(), 3); // 2 genesis + 1 reward
         let _ = std::fs::remove_dir_all(&dir);

@@ -137,6 +137,8 @@ pub enum Command {
 /// Node-level configuration the network task needs.
 pub struct Config {
     pub network: String,
+    /// Community economy: TC any member's thanks can create per day.
+    pub daily_allowance: u64,
     pub enable_mdns: bool,
     pub data_dir: PathBuf,
     /// TimeCoin per started 100 KiB for storing a blob. 0 = store for free.
@@ -167,6 +169,8 @@ pub struct Network {
     /// Relay to reserve a slot on once we're connected to it.
     relay: Option<(PeerId, Multiaddr)>,
     relay_reserved: bool,
+    /// Configured bootstrap addresses, redialed whenever we're alone.
+    bootstrap_addrs: Vec<Multiaddr>,
     pending_msgs: HashMap<OutboundRequestId, oneshot::Sender<Result<()>>>,
     pending_blobs: HashMap<OutboundRequestId, oneshot::Sender<Result<BlobResponse>>>,
     /// Ledger transfer ids already redeemed for storage (anti double-redeem).
@@ -289,6 +293,7 @@ impl Network {
             topic: topic.clone(),
             relay: None,
             relay_reserved: false,
+            bootstrap_addrs: Vec::new(),
             pending_msgs: HashMap::new(),
             pending_blobs: HashMap::new(),
             used_payments,
@@ -326,7 +331,8 @@ impl Network {
                 })?;
             self.relay = Some((peer_id, relay_addr.clone()));
         }
-        for addr in bootstrap.iter().chain(relay) {
+        self.bootstrap_addrs = bootstrap.iter().chain(relay).cloned().collect();
+        for addr in self.bootstrap_addrs.clone() {
             match self.swarm.dial(addr.clone()) {
                 Ok(()) => info!("dialing peer {addr}"),
                 Err(e) => warn!("failed to dial {addr}: {e}"),
@@ -361,6 +367,9 @@ impl Network {
         // Refresh DHT routing periodically so the mesh heals as peers churn.
         let mut kad_refresh = tokio::time::interval(Duration::from_secs(300));
         kad_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Future-dated transactions get another chance once their time comes.
+        let mut release_tick = tokio::time::interval(Duration::from_secs(30));
+        release_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 command = self.commands.recv() => match command {
@@ -371,6 +380,21 @@ impl Network {
                 _ = kad_refresh.tick() => {
                     if self.swarm.behaviour_mut().kad.bootstrap().is_err() {
                         debug!("kad bootstrap skipped: no known peers yet");
+                    }
+                }
+                _ = release_tick.tick() => {
+                    let released = self.dag.lock().unwrap().release_due(now());
+                    if !released.is_empty() {
+                        info!("released {} future-dated transaction(s) whose time arrived", released.len());
+                    }
+                    // Alone but configured with peers? Keep trying — nodes
+                    // restart, laptops sleep, networks blip.
+                    if self.peers.lock().unwrap().is_empty() {
+                        for addr in self.bootstrap_addrs.clone() {
+                            if let Err(e) = self.swarm.dial(addr.clone()) {
+                                debug!("bootstrap redial {addr}: {e}");
+                            }
+                        }
                     }
                 }
             }
@@ -425,7 +449,7 @@ impl Network {
         let mut dag = self.dag.lock().unwrap();
         for tx in txs {
             let id = tx.id.clone();
-            match dag.insert(tx) {
+            match dag.insert(tx, now()) {
                 Ok(accepted) if !accepted.is_empty() => {
                     info!(
                         "accepted {} transaction(s) from {source} (dag size {})",

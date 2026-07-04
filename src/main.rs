@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use libp2p::Multiaddr;
 use serde::Deserialize;
-use serde_json::Value;
+use std::future::IntoFuture;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -36,6 +36,15 @@ enum CliCommand {
         /// ledgers, topics, and protocols.
         #[arg(long, default_value = "main")]
         network: String,
+        /// Community economy: how much TimeCoin any one member's thanks can
+        /// create per day. Part of the network's identity — all members must
+        /// use the same value (the join file carries it). 0 = unlimited.
+        #[arg(long, default_value_t = 100)]
+        daily_allowance: u64,
+        /// Public read-only invite listener serving the join page, join file,
+        /// and QR ("off" to disable).
+        #[arg(long, default_value = "0.0.0.0:3080")]
+        invite: String,
         /// libp2p listen port (TCP and QUIC). 0 picks a random port.
         #[arg(long, default_value_t = 9000)]
         port: u16,
@@ -187,10 +196,16 @@ enum CliCommand {
 #[derive(Deserialize)]
 struct JoinFile {
     network: String,
+    #[serde(default = "default_allowance")]
+    daily_allowance: u64,
     #[serde(default)]
     bootstrap: Vec<Multiaddr>,
     #[serde(default)]
     relay: Option<Multiaddr>,
+}
+
+fn default_allowance() -> u64 {
+    100
 }
 
 #[tokio::main]
@@ -206,6 +221,8 @@ async fn main() -> Result<()> {
             config,
             data_dir,
             mut network,
+            mut daily_allowance,
+            invite,
             port,
             api,
             mut bootstrap,
@@ -223,18 +240,20 @@ async fn main() -> Result<()> {
                 )
                 .with_context(|| format!("parsing join file {}", path.display()))?;
                 network = join.network;
+                daily_allowance = join.daily_allowance;
                 bootstrap = join.bootstrap;
                 relay = join.relay;
             }
             let config = network::Config {
                 network,
+                daily_allowance,
                 enable_mdns: !no_mdns,
                 data_dir: data_dir.clone(),
                 blob_price,
                 blob_max_bytes: blob_max_kib * 1024,
                 blob_trust_depth,
             };
-            run(data_dir, port, api, bootstrap, relay, external_address, config).await
+            run(data_dir, port, api, bootstrap, relay, external_address, config, invite).await
         }
         CliCommand::Status { api } => print_json(&get(&api, "/status")?),
         CliCommand::Balances { api, trusted } => {
@@ -251,23 +270,7 @@ async fn main() -> Result<()> {
         CliCommand::Name { api, set } => {
             print_json(&post(&api, "/name", serde_json::json!({"name": set}))?)
         }
-        CliCommand::JoinFile { api } => {
-            let status = get(&api, "/status")?;
-            let bootstrap: Vec<&str> = status["listen_addrs"]
-                .as_array()
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|v| v.as_str())
-                        .filter(|s| !s.contains("/127.0.0.1/") && !s.contains("/::1/"))
-                        .collect()
-                })
-                .unwrap_or_default();
-            print_json(&serde_json::json!({
-                "network": status["network"],
-                "bootstrap": bootstrap,
-                "relay": Value::Null,
-            }))
-        }
+        CliCommand::JoinFile { api } => print_json(&get(&api, "/join.json")?),
         CliCommand::Reward { api, to, amount, memo } => print_json(&post(
             &api,
             "/reward",
@@ -306,16 +309,24 @@ async fn run(
     relay: Option<Multiaddr>,
     external_addresses: Vec<Multiaddr>,
     config: network::Config,
+    invite: String,
 ) -> Result<()> {
     let keypair = identity::load_or_generate(&data_dir)?;
     let peer_id = keypair.public().to_peer_id();
     let wallet = dag::wallet_address(&peer_id);
     let network_name = config.network.clone();
+    let daily_allowance = config.daily_allowance;
     println!("network : {}", config.network);
     println!("peer id : {peer_id}");
     println!("wallet  : {wallet}");
 
-    let dag = Arc::new(Mutex::new(dag::Dag::load(&data_dir, &config.network)?));
+    let dag = Arc::new(Mutex::new(dag::Dag::load(
+        &data_dir,
+        &dag::Params {
+            network: config.network.clone(),
+            daily_allowance: config.daily_allowance,
+        },
+    )?));
     let peers = Arc::new(Mutex::new(HashSet::new()));
     let (command_tx, command_rx) = mpsc::channel(64);
 
@@ -328,6 +339,7 @@ async fn run(
     net.bootstrap(&bootstrap, relay.as_ref())?;
     let network_task = tokio::spawn(net.run());
 
+    let invite_enabled = invite != "off";
     let state = api::AppState {
         dag,
         peers,
@@ -337,15 +349,30 @@ async fn run(
         peer_id,
         wallet,
         network: network_name,
+        daily_allowance,
+        invite_addr: invite_enabled.then(|| invite.clone()),
         data_dir,
     };
     let listener = tokio::net::TcpListener::bind(&api_addr)
         .await
         .with_context(|| format!("binding HTTP API on {api_addr}"))?;
     println!("HTTP API + dashboard: http://{api_addr}");
-    let api_task = tokio::spawn(async move {
-        axum::serve(listener, api::router(state)).await
-    });
+    let api_task = tokio::spawn(axum::serve(listener, api::router(state.clone())).into_future());
+
+    // Read-only invite listener: safe to expose on the LAN so a scanned QR
+    // opens a real page instead of raw JSON. Serves only join info. Losing
+    // it (port taken by another local node) is not worth dying over.
+    if invite_enabled {
+        match tokio::net::TcpListener::bind(&invite).await {
+            Ok(invite_listener) => {
+                println!("Invite page: http://{invite}/join (read-only, shareable on your LAN)");
+                tokio::spawn(axum::serve(invite_listener, api::invite_router(state)).into_future());
+            }
+            Err(e) => eprintln!(
+                "invite listener disabled: could not bind {invite}: {e} (pick another with --invite, or --invite off)"
+            ),
+        }
+    }
 
     tokio::select! {
         r = network_task => anyhow::bail!("network task exited: {r:?}"),

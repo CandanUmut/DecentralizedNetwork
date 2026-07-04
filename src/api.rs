@@ -32,6 +32,9 @@ pub struct AppState {
     pub peer_id: PeerId,
     pub wallet: String,
     pub network: String,
+    pub daily_allowance: u64,
+    /// Bind address of the read-only invite listener, if enabled.
+    pub invite_addr: Option<String>,
     pub data_dir: std::path::PathBuf,
 }
 
@@ -67,8 +70,26 @@ pub fn router(state: AppState) -> Router {
         .route("/store", post(store))
         .route("/fetch/{hash}", get(fetch))
         .route("/verify/{hash}", get(verify))
+        .route("/allowance", get(allowance))
+        .route("/join.json", get(join_json))
         .route("/join-qr.svg", get(join_qr))
         .with_state(state)
+}
+
+/// The read-only invite surface, safe to expose on the LAN: the join page a
+/// scanned QR opens, the downloadable join file, and the QR itself. No
+/// wallet-touching endpoints.
+pub fn invite_router(state: AppState) -> Router {
+    Router::new()
+        .route("/", get(invite_page))
+        .route("/join", get(invite_page))
+        .route("/join.json", get(join_json))
+        .route("/join-qr.svg", get(join_qr))
+        .with_state(state)
+}
+
+async fn invite_page() -> Html<&'static str> {
+    Html(include_str!("invite.html"))
 }
 
 fn now() -> u64 {
@@ -129,6 +150,7 @@ async fn status(State(s): State<AppState>) -> Json<Value> {
     };
     Json(json!({
         "network": s.network,
+        "daily_allowance": s.daily_allowance,
         "peer_id": s.peer_id.to_string(),
         "wallet": s.wallet,
         "balance": my_balance,
@@ -141,8 +163,24 @@ async fn status(State(s): State<AppState>) -> Json<Value> {
     }))
 }
 
-async fn peers(State(s): State<AppState>) -> Json<Vec<String>> {
-    Json(s.peers.lock().unwrap().iter().map(|p| p.to_string()).collect())
+/// Connected peers as people: peer id, wallet, and display name if known.
+async fn peers(State(s): State<AppState>) -> Json<Vec<Value>> {
+    let names = s.dag.lock().unwrap().names();
+    Json(
+        s.peers
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|p| {
+                let wallet = wallet_address(p);
+                json!({
+                    "peer_id": p.to_string(),
+                    "wallet": wallet,
+                    "name": names.get(&wallet),
+                })
+            })
+            .collect(),
+    )
 }
 
 async fn tips(State(s): State<AppState>) -> Json<Vec<String>> {
@@ -295,6 +333,18 @@ async fn reward(
     if receiver == s.wallet {
         return bad("cannot mint a reward to yourself — ask the peer you helped to run this");
     }
+    // Refuse thanks that wouldn't count: the network would accept the
+    // transaction but the allowance rule would value it at zero.
+    if s.daily_allowance > 0 {
+        let given = s.dag.lock().unwrap().given_on_day(&s.wallet, crate::dag::day_of(now()));
+        let remaining = s.daily_allowance.saturating_sub(given);
+        if req.amount > remaining {
+            return bad(format!(
+                "that would exceed today's giving allowance — you can still give {remaining} of {} TC today",
+                s.daily_allowance
+            ));
+        }
+    }
     submit(&s, TxKind::Reward, receiver, req.amount, 0, req.memo.unwrap_or_default()).await
 }
 
@@ -360,7 +410,7 @@ async fn submit(
             Ok(tx) => tx,
             Err(e) => return internal(format!("failed to create transaction: {e}")),
         };
-        if let Err(e) = dag.insert(tx.clone()) {
+        if let Err(e) = dag.insert(tx.clone(), now()) {
             return bad(format!("transaction rejected: {e}"));
         }
         tx
@@ -629,21 +679,62 @@ async fn verify(
     }
 }
 
-/// The join file as a scannable QR (SVG), for phones.
-async fn join_qr(State(s): State<AppState>) -> axum::response::Response {
-    use axum::response::IntoResponse;
+/// Public multiaddrs of this node (non-loopback, with peer id).
+async fn public_addrs(s: &AppState) -> Vec<String> {
     let listen_addrs = {
         let (reply, rx) = oneshot::channel();
         let _ = s.commands.send(Command::ListenAddrs(reply)).await;
         rx.await.unwrap_or_default()
     };
-    let bootstrap: Vec<String> = listen_addrs
+    listen_addrs
         .into_iter()
-        .map(|a| format!("{a}/p2p/{}", s.peer_id))
+        .map(|a| {
+            let suffix = format!("/p2p/{}", s.peer_id);
+            let a = a.to_string();
+            if a.ends_with(&suffix) { a } else { format!("{a}{suffix}") }
+        })
         .filter(|a| !a.contains("/127.0.0.1/") && !a.contains("/::1/"))
-        .collect();
-    let join = json!({ "network": s.network, "bootstrap": bootstrap }).to_string();
-    match qrcode::QrCode::new(join.as_bytes()) {
+        .collect()
+}
+
+/// Best-guess LAN IP, taken from our own listen addresses.
+fn lan_ip(addrs: &[String]) -> Option<String> {
+    addrs.iter().find_map(|a| {
+        let mut parts = a.split('/');
+        // multiaddr: /ip4/X/…
+        match (parts.nth(1), parts.next()) {
+            (Some("ip4"), Some(ip)) if ip != "127.0.0.1" => Some(ip.to_string()),
+            _ => None,
+        }
+    })
+}
+
+/// The community join file — everything a friend's node needs.
+async fn join_json(State(s): State<AppState>) -> Json<Value> {
+    let bootstrap = public_addrs(&s).await;
+    Json(json!({
+        "network": s.network,
+        "daily_allowance": s.daily_allowance,
+        "bootstrap": bootstrap,
+        "relay": Value::Null,
+    }))
+}
+
+/// The invite as a scannable QR (SVG). Encodes the URL of the invite page
+/// when the invite listener is on (so a phone opens a real page), falling
+/// back to the raw join file otherwise.
+async fn join_qr(State(s): State<AppState>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let bootstrap = public_addrs(&s).await;
+    let content = match (&s.invite_addr, lan_ip(&bootstrap)) {
+        (Some(invite), Some(ip)) => {
+            let port = invite.rsplit(':').next().unwrap_or("3080");
+            format!("http://{ip}:{port}/join")
+        }
+        _ => json!({ "network": s.network, "daily_allowance": s.daily_allowance, "bootstrap": bootstrap })
+            .to_string(),
+    };
+    match qrcode::QrCode::new(content.as_bytes()) {
         Ok(code) => {
             let svg = code
                 .render::<qrcode::render::svg::Color>()
@@ -653,6 +744,20 @@ async fn join_qr(State(s): State<AppState>) -> axum::response::Response {
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("QR failed: {e}")).into_response(),
     }
+}
+
+/// Today's giving allowance: how much thanks this node can still mint today.
+async fn allowance(State(s): State<AppState>) -> Json<Value> {
+    let today = crate::dag::day_of(now());
+    let (given, allowance) = {
+        let dag = s.dag.lock().unwrap();
+        (dag.given_on_day(&s.wallet, today), dag.params().daily_allowance)
+    };
+    Json(json!({
+        "daily_allowance": allowance,
+        "given_today": given,
+        "remaining_today": if allowance == 0 { Value::Null } else { json!(allowance.saturating_sub(given)) },
+    }))
 }
 
 async fn blob_roundtrip(
