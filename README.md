@@ -1,10 +1,11 @@
 # DecentralizedNetwork · TimeCoin node
 
-A minimal peer-to-peer node, built on **upstream [libp2p](https://libp2p.io) 0.56** (no
-forked libraries), that maintains a DAG-based ledger of **TimeCoin** — a coin earned by
-attested contributions, not mining. Nodes discover each other, gossip signed records into
-a shared tangle, **converge on the same ledger and balances**, exchange encrypted direct
-messages, and can **pay each other to store data**.
+A community's own network: every member's computer keeps one shared, tamper-proof record
+of **who helped whom**. **TimeCoin** is created only by *thanking* someone — never bought
+or mined — and each member's thanks can create only a **fixed daily allowance**, agreed
+at the community's birth. Members message each other end-to-end encrypted and pay each
+other to store data. No company, no server, no ads. **Read [VISION.md](VISION.md) for
+the why** — built on upstream [libp2p](https://libp2p.io) 0.56, no forked libraries.
 
 This is the deliberately small, honest core of a larger vision (shared compute, storage,
 simulations, safe comms + earning). Where it's going: [ROADMAP.md](ROADMAP.md). What's in
@@ -21,11 +22,15 @@ vs. deferred: [SCOPE.md](SCOPE.md). How the old fork-based code was assessed and
   every node computes identically: double-spends resolve to the same winner everywhere,
   and an overdrafting transaction — even from a modified client — simply never applies.
   Network-wide balances cannot go negative.
-- **Trust is social.** You `vouch` for wallets you know; your *trusted view* of balances
-  counts only rewards minted inside your vouch neighborhood, so a stranger's self-minted
-  fortune is worth nothing to you. Wallets can set display names (labels, not identities).
-- Communities are isolated: `--network koop` has its own genesis, topics, and protocols —
-  and joining one is a single `join-file` handed to a friend.
+- **Giving is rationed like time.** Each member's thanks can create at most the
+  community's `--daily-allowance` (default 100 TC) per day — enforced by every node's
+  ledger fold, with timestamps that must flow forward along the DAG and future-dated
+  transactions parked until their time arrives. That scarcity is the economy.
+- **Trust is social.** You `vouch` for wallets you know (revocably); your *trusted view*
+  counts only rewards minted inside your vouch neighborhood, and a member's rewards only
+  count from the moment someone trusted vouched for them — no backdated histories.
+- Communities are isolated: the network name **and its economy rules** are baked into
+  genesis; joining one is a single join file (or a scanned QR that opens an invite page).
 
 ## Install
 
@@ -40,8 +45,13 @@ Tagged releases also ship prebuilt Linux/macOS/Windows binaries via GitHub Actio
 ```bash
 timecoin-node run --data-dir ~/.timecoin
 # open http://127.0.0.1:3000 — the dashboard is phone-friendly:
-# Home (balances/activity) · Act (thank/send/vouch) · Chat · Join (QR invite)
+# Home (balances/activity) · Act (thank/send/vouch + daily allowance meter)
+# Chat (encrypted messages, by name) · Join (QR invite)
 ```
+
+The QR on the Join tab opens a read-only **invite page** (served on `--invite`, default
+`0.0.0.0:3080`) that explains the project and hands your friend the join file — scanning
+it on a phone shows a real page, not raw JSON. `--invite off` disables it.
 
 ## Quickstart (one machine)
 
@@ -198,8 +208,13 @@ inside the compose network for the demo).
   view — rigged coin from outside buys nothing. Verified live, including refusal paths.
 - Custody **spot-checks**: store-time probes let you later verify a provider still holds
   your blob (verified live: deletion is detected).
-- Direct messages, delta sync, relay fallback, one-command docker cluster, mobile-first
-  dashboard with QR invites.
+- **Daily giving allowance** enforced identically by every node (verified live: an
+  over-allowance thank is refused locally with the remaining budget, and even a modified
+  client's excess mint counts for zero on all nodes); allowance meter in the app.
+- **Self-healing connections**: a node that finds itself alone redials its bootstrap
+  peers every 30 s (verified live across a peer restart).
+- Direct messages (shown by *name*), delta sync, relay fallback, one-command docker
+  cluster, mobile-first dashboard, QR → invite page → join file flow.
 
 **Doesn't work / doesn't exist (on purpose, for now — see ROADMAP.md):**
 - **Sybil resistance is social, not cryptographic.** Trusted views + trust-gated
@@ -212,6 +227,10 @@ inside the compose network for the demo).
   payment burned on a refused Put after a passed quote is also not auto-refunded.
 - No store-and-forward messaging for offline peers.
 - Full history still replicates to every node; blobs capped (512 KiB default).
+- **Known allowance edge:** a member can back-fill *unused past days* of their own
+  allowance by attaching to old parents with old dates. It's visible on-chain as
+  backdating, bounded by their membership anchor in trusted views, and will be closed by
+  periodic checkpoints (ROADMAP). It does not allow exceeding any day's budget.
 - **Not audited.** Don't put anything valuable on it.
 
 ## Repo layout

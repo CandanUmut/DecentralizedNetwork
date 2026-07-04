@@ -68,6 +68,11 @@
   </div>
 
   <div id="tab-act" class="tab">
+    <div class="card"><h2>Today's giving</h2>
+      <div id="allowance_meter" style="font-size:1.05rem">–</div>
+      <div class="dim" style="color:var(--dim);font-size:.8rem">TimeCoin is created only by
+      thanking someone. Your thanks can create at most this much per day — that scarcity is
+      what makes it mean something.</div></div>
     <div class="card"><h2>Thank someone (mints TimeCoin to them)</h2>
       <form data-post="/reward">
         <label>Who helped you (name, wallet, or peer id)</label>
@@ -109,11 +114,21 @@
   </div>
 
   <div id="tab-join" class="tab">
-    <div class="card"><h2>Invite someone — scan or share</h2>
+    <div class="card"><h2>Invite someone — have them scan this</h2>
       <img id="qr" src="/join-qr.svg" alt="join QR">
-      <p class="addr">The QR contains this community's join file. On their machine:<br>
-      <code>timecoin-node run --config join.json</code></p>
+      <p class="addr">Scanning opens an invite page (on your local network) that explains
+      what this is and hands them the join file. Or download it yourself from
+      <a href="/join.json" download="join.json">join.json</a> and send it any way you like —
+      on their machine: <code>timecoin-node run --config join.json</code>.
+      On the same wifi, nodes also find each other automatically.</p>
       <div id="addrs"></div></div>
+    <div class="card"><h2>What is this?</h2>
+      <p class="addr">A community-run network: every member's computer keeps one shared,
+      tamper-proof record of who helped whom. TimeCoin is created only by thanking someone
+      — never bought or mined — and each member can give a limited amount of thanks per
+      day. Messages are end-to-end encrypted and travel directly between members. No
+      company, no server, no ads. See VISION.md in the repo for the full story and the
+      honest limits.</p></div>
   </div>
 </main>
 <datalist id="known"></datalist>
@@ -161,9 +176,10 @@ document.querySelectorAll('form[data-post]').forEach(f => f.onsubmit = async e =
 async function refresh() {
   try {
     const trusted = $('trusted_toggle').checked;
-    const [st, bal, txs, names, tbal, inbox] = await Promise.all(
+    const [st, bal, txs, names, tbal, inbox, peers, allow] = await Promise.all(
       ['/status', `/balances?trusted=${trusted}`, '/transactions', '/names',
-       '/balance?trusted=true', '/messages'].map(u => fetch(u).then(r => r.json())));
+       '/balance?trusted=true', '/messages', '/peers', '/allowance']
+       .map(u => fetch(u).then(r => r.json())));
 
     NAMES = names;
     WALLETS_BY_NAME = Object.fromEntries(Object.entries(names).map(([w, n]) => [n.toLowerCase(), w]));
@@ -190,10 +206,15 @@ async function refresh() {
         `<td>${t.amount || ''}</td>` +
         `<td class="${t.applied ? 'ok' : 'dead'}">${t.kind === 'transfer' ? (t.applied ? '✓' : '✗') : ''}</td></tr>`).join('');
 
-    $('peers').innerHTML = st.connected_peers.map(p => `<tr><td><code>${esc(p)}</code></td></tr>`).join('')
+    $('peers').innerHTML = peers.map(p =>
+      `<tr><td>${esc(p.name || short(p.wallet))}</td><td><code>${esc(short(p.peer_id))}</code></td></tr>`).join('')
       || '<tr><td class="dead">alone — share the Join tab with someone</td></tr>';
-    $('msg_peer').innerHTML = st.connected_peers
-      .map(p => `<option value="${esc(p)}">${esc(label(nameOfPeerWallet(p)) || short(p))}</option>`).join('');
+    $('msg_peer').innerHTML = peers
+      .map(p => `<option value="${esc(p.peer_id)}">${esc(p.name || short(p.wallet))}</option>`).join('');
+
+    $('allowance_meter').innerHTML = allow.daily_allowance
+      ? `<b>${allow.remaining_today}</b> of <b>${allow.daily_allowance}</b> TC left to give today`
+      : 'unlimited giving on this network';
 
     $('inbox').innerHTML = inbox.slice(-20).reverse().map(m =>
       `<tr><td title="${esc(m.from_wallet)}">${esc(label(m.from_wallet))}</td><td>${esc(m.text)}</td></tr>`).join('')
@@ -202,8 +223,6 @@ async function refresh() {
     $('addrs').innerHTML = st.listen_addrs.map(a => `<div class="addr">${esc(a)}</div>`).join('');
   } catch (e) { $('me').textContent = 'node unreachable'; }
 }
-// We can't derive a wallet from a peer id in the browser; show the peer id.
-function nameOfPeerWallet() { return null; }
 $('trusted_toggle').onchange = refresh;
 refresh();
 setInterval(refresh, 3000);

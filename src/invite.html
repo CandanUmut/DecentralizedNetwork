@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>You're invited · TimeCoin</title>
+<style>
+  :root { color-scheme: light dark;
+    --fg:#1a1d21; --bg:#f4f5f7; --card:#fff; --line:#e2e5e9; --dim:#6b7280;
+    --acc:#0f766e; --acc-fg:#fff; }
+  @media (prefers-color-scheme: dark) {
+    :root { --fg:#e6e8ea; --bg:#101214; --card:#1b1e22; --line:#2c3138; --dim:#9aa3ad;
+            --acc:#14b8a6; --acc-fg:#06251f; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; font:16px/1.6 system-ui,sans-serif; color:var(--fg); background:var(--bg); }
+  main { max-width:560px; margin:0 auto; padding:2rem 1.25rem 4rem; }
+  h1 { font-size:1.5rem; margin:.2rem 0; }
+  h1 em { color:var(--acc); font-style:normal; }
+  .sub { color:var(--dim); margin-bottom:1.5rem; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px;
+          padding:1.1rem 1.2rem; margin-bottom:1rem; }
+  .card h2 { font-size:.85rem; margin:0 0 .5rem; color:var(--dim);
+             text-transform:uppercase; letter-spacing:.05em; }
+  ol { padding-left:1.2rem; margin:.4rem 0; } li { margin:.35rem 0; }
+  code, pre { font-size:.85em; background:var(--bg); border-radius:6px; padding:.1rem .35rem; }
+  pre { padding:.7rem .8rem; overflow-x:auto; }
+  button, a.btn { display:block; width:100%; text-align:center; font:inherit; font-weight:600;
+    border:0; border-radius:10px; padding:.8rem 1rem; background:var(--acc);
+    color:var(--acc-fg); text-decoration:none; margin-top:.6rem; cursor:pointer; }
+  .dim { color:var(--dim); font-size:.85rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1>You're invited to <em id="net">a community</em></h1>
+  <p class="sub">A small network run entirely by its members — no company, no server, no ads.</p>
+
+  <div class="card">
+    <h2>What is this?</h2>
+    <p>Every member runs a small program on their own computer. The programs find each
+    other and keep one shared, tamper-proof notebook of <b>who helped whom</b>.</p>
+    <p><b>TimeCoin</b> is the unit of that notebook. It cannot be bought or mined — it is
+    created only when a member <i>thanks</i> another member for real help, and each member
+    can give at most <b><span id="allow">…</span> TC of thanks per day</b>. Scarce like
+    time, backed by gratitude.</p>
+    <p>Messages between members are end-to-end encrypted and travel directly between your
+    computers. Files can be stored with members you trust, paid in TimeCoin. If every
+    server on the internet vanished tomorrow, this community's notebook, messages, and
+    money would keep working.</p>
+  </div>
+
+  <div class="card">
+    <h2>Join in 3 steps</h2>
+    <ol>
+      <li><b>Install</b> the node on your computer (not this phone):
+        <pre>git clone https://github.com/CandanUmut/DecentralizedNetwork
+cd DecentralizedNetwork && ./install.sh</pre></li>
+      <li><b>Download the join file</b> below and put it next to the program
+        (or send it to yourself — it's just a small text file).</li>
+      <li><b>Run</b>:
+        <pre>timecoin-node run --data-dir ~/.timecoin --config join.json</pre>
+        then open <code>http://127.0.0.1:3000</code> — that's your dashboard.
+        Ask the person who invited you to <b>vouch</b> for you so your coin counts.</li>
+    </ol>
+    <button id="dl">Download join file (join.json)</button>
+    <button id="share" style="display:none">Share the join file…</button>
+    <p class="dim" id="boot"></p>
+  </div>
+
+  <div class="card">
+    <h2>Why it's different</h2>
+    <p class="dim">Regular apps live on a company's servers: the company sees everything,
+    owns the record, and can change the rules or disappear. Here, <i>you</i> hold your
+    identity (a key on your machine), the record is replicated to every member, money is
+    created by attested help instead of speculation, and trust is a web of real vouches
+    between people who know each other — revocable when it's misplaced. Honest limits:
+    this is young software, not audited, and it works because members trust each other.
+    It is a tool for communities, not a get-rich coin.</p>
+  </div>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+let JOIN = null;
+fetch('/join.json').then(r => r.json()).then(j => {
+  JOIN = j;
+  $('net').textContent = `“${j.network}”`;
+  $('allow').textContent = j.daily_allowance || '∞';
+  $('boot').textContent = 'This file points at: ' + (j.bootstrap || []).join('  ·  ');
+  if (navigator.share) $('share').style.display = 'block';
+});
+function file() {
+  return new File([JSON.stringify(JOIN, null, 2)], 'join.json', { type: 'application/json' });
+}
+$('dl').onclick = () => {
+  const url = URL.createObjectURL(file());
+  const a = Object.assign(document.createElement('a'), { href: url, download: 'join.json' });
+  a.click(); URL.revokeObjectURL(url);
+};
+$('share').onclick = () => navigator.share({ files: [file()], title: 'Join my TimeCoin community' }).catch(()=>{});
+</script>
+</body>
+</html>

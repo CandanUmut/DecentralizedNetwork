@@ -81,12 +81,17 @@ The MVP converges, but anyone can mint and a modified client can double-spend. F
   of a vouched wallet going rogue between its compromise and your revocation.
 - **Trust-gated services** *(shipped)*: storage providers can serve only their vouch
   neighborhood and verify payments against their trusted ledger view.
-- **Rate limits & mint budgets over time** *(still open, deliberately not faked)*:
-  per-epoch budgets need all nodes to agree which epoch a transaction belongs to, but
-  DAG timestamps are self-claimed — deterministic enforcement either needs anchored
-  time (checkpoint transactions) or acceptance windows that break convergence at the
-  edges. The shipped mint caps bound *totals*, not *rates*; the time dimension is
-  recorded here until there's an answer that doesn't cheat.
+- **Daily mint allowance** *(shipped)*: each attester's rewards count only up to the
+  community's per-day allowance (baked into genesis, enforced in every node's fold),
+  made workable by three timestamp rules: time must flow forward along the DAG
+  (parent monotonicity, checked at accept), future-dated transactions are parked until
+  their claimed time arrives (you can't pre-farm tomorrow), and in trusted views a
+  member's rewards only count from their first trusted vouch (you can't arrive with a
+  backdated history). *Remaining edge, stated plainly:* unused allowance of **past**
+  days since one's membership anchor can be back-filled by attaching old-dated rewards
+  to old parents — visible on-chain, bounded per day, and closable later by periodic
+  community checkpoints that freeze history's horizon. Until then it bounds abuse
+  rather than eliminating it.
 
 ## Stage 4 — the marketplace layer
 
