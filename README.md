@@ -1,5 +1,8 @@
 # DecentralizedNetwork · TimeCoin node
 
+[![CI](https://github.com/CandanUmut/DecentralizedNetwork/actions/workflows/ci.yml/badge.svg)](https://github.com/CandanUmut/DecentralizedNetwork/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+
 A community's own network: every member's computer keeps one shared, tamper-proof record
 of **who helped whom**. **TimeCoin** is created only by *thanking* someone — never bought
 or mined — and each member's thanks can create only a **fixed daily allowance**, agreed
@@ -8,9 +11,12 @@ other to store data. No company, no server, no ads. **Read [VISION.md](VISION.md
 the why** — built on upstream [libp2p](https://libp2p.io) 0.56, no forked libraries.
 
 This is the deliberately small, honest core of a larger vision (shared compute, storage,
-simulations, safe comms + earning). Where it's going: [ROADMAP.md](ROADMAP.md). What's in
-vs. deferred: [SCOPE.md](SCOPE.md). How the old fork-based code was assessed and rebuilt:
-[ASSESSMENT.md](ASSESSMENT.md). The original source is preserved under [`legacy/`](legacy/).
+simulations, safe comms + earning). **How it all works under the hood — the DAG, the
+libp2p networking, discovery without servers, the security model, the future compute
+design: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).** Where it's going:
+[docs/ROADMAP.md](docs/ROADMAP.md). How this project was revived from its original code
+— and that code itself — lives in [docs/history/](docs/history/) and in git history at
+commit `2192a1b` (tagged `legacy-source` locally).
 
 ## The ledger rules (30 seconds)
 
@@ -216,7 +222,7 @@ inside the compose network for the demo).
 - Direct messages (shown by *name*), delta sync, relay fallback, one-command docker
   cluster, mobile-first dashboard, QR → invite page → join file flow.
 
-**Doesn't work / doesn't exist (on purpose, for now — see ROADMAP.md):**
+**Doesn't work / doesn't exist (on purpose, for now — see [docs/ROADMAP.md](docs/ROADMAP.md)):**
 - **Sybil resistance is social, not cryptographic.** Trusted views + trust-gated
   services + mint caps make rigged coin useless *inside* a well-kept neighborhood, but
   nothing stops strangers from minting in the raw view, and a vouched wallet that goes
@@ -236,14 +242,24 @@ inside the compose network for the demo).
 ## Repo layout
 
 ```
-src/            the node (dag, network, api, identity, dashboard, cli)
-scripts/        runnable demos (relay fallback)
-legacy/         the original fork-era source, unmodified, for reference
-ASSESSMENT.md   Phase-0 inventory: what was here, what the fork did, what was salvaged
-SCOPE.md        what the revival MVP was and was not
-ROADMAP.md      the staged path from here to the full vision
-CHANGELOG.md    what changed and why
+src/             the whole node: dag.rs (ledger rules), network.rs (libp2p),
+                 api.rs (HTTP + orchestration), main.rs (CLI), *.html (web UI)
+scripts/         runnable demos (relay fallback)
+docs/ROADMAP.md  the staged path from here to the full vision, open problems included
+docs/history/    how this came to be: assessment of the original code, scope
+                 decisions, the author's original notes (pre-rewrite source
+                 itself is in git history at commit `2192a1b` (tagged `legacy-source` locally))
+VISION.md        why this exists — start here if you're new
+CONTRIBUTING.md  build/test/demo instructions and the ground rules
+CHANGELOG.md     what changed and why, release by release
 ```
+
+## Contributing
+
+PRs welcome — read [CONTRIBUTING.md](CONTRIBUTING.md) first (two-minute read: how to
+build and test, where things live, and the ground rules — chiefly: never fake, and
+determinism in the ledger is sacred). Security reports: see
+[.github/SECURITY.md](.github/SECURITY.md).
 
 ## License
 

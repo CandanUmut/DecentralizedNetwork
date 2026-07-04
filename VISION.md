@@ -74,7 +74,7 @@ protocol and a payment convention on the same ledger.
 - **No proof-of-work, no staking, no token sale.** The scarce resource here is standing
   with people who know you. That cannot be bought, burned, or delegated — which is the
   point.
-- **No pretending.** The docs in this repo (README, ROADMAP, ASSESSMENT) state plainly
+- **No pretending.** The docs in this repo (README, docs/ROADMAP.md, docs/history/) state plainly
   what is verified, what is weak, and what is unsolved. Today's honest limits: it works
   among people with baseline trust in each other; it is young, unaudited software; a
   determined insider can still game edges of it until the web of trust reacts. It is a

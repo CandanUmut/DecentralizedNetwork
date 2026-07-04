@@ -1,6 +1,6 @@
 //! Local HTTP API + dashboard. Successor of the legacy Axum routes; the
 //! messaging and (paid) storage endpoints revive the legacy features on the
-//! v2 ledger. See ROADMAP.md Stage 2.
+//! v2 ledger. See docs/ROADMAP.md Stage 2.
 
 use crate::dag::{wallet_address, Dag, Transaction, TxKind};
 use crate::network::{BlobRequest, BlobResponse, Command, InboxMessage};
@@ -558,7 +558,7 @@ async fn store(
             Err(e) => return bad(e),
         }
     }
-    bad(format!("provider kept refusing: {last_refusal} (payment {payment_id} was still made — retry /store later without paying again is NOT possible yet; see ROADMAP escrow)"))
+    bad(format!("provider kept refusing: {last_refusal} (payment {payment_id} was still made — retry /store later without paying again is NOT possible yet; see docs/ROADMAP.md escrow)"))
 }
 
 #[derive(Deserialize)]

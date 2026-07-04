@@ -1,5 +1,9 @@
 # ASSESSMENT — Phase 0 inventory of the DecentralizedNetwork repo
 
+> **Historical document.** This is the inventory that guided the 2026 revival. The
+> `legacy/` paths it references were removed from the working tree during the
+> open-source cleanup; check out commit `2192a1b` (tagged `legacy-source` locally) to browse them.
+
 Date: 2026-07-02. Assessed at commit `f1cbaff` (branch `main`).
 
 ## TL;DR
