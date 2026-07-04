@@ -21,6 +21,7 @@ libp2p = { version = "0.56.0", features = [
     "mdns",
     "identify",
     "ping",
+    "kad",
     "relay",
     "dcutr",
     "autonat",
@@ -37,6 +38,8 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_bytes = "0.11"
 base64 = "0.22"
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+rand = "0.8"
 sha2 = "0.10"
 hex = "0.4"
 anyhow = "1.0"

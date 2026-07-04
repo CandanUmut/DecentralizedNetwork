@@ -32,6 +32,17 @@ pub struct AppState {
     pub peer_id: PeerId,
     pub wallet: String,
     pub network: String,
+    pub data_dir: std::path::PathBuf,
+}
+
+/// A custody probe remembered at store time: the hash of a random slice of
+/// the blob, checkable later without keeping the blob around.
+#[derive(Debug, Clone, serde::Serialize, Deserialize)]
+struct Probe {
+    hash: String,
+    offset: u64,
+    len: u32,
+    expected: String,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -44,6 +55,7 @@ pub fn router(state: AppState) -> Router {
         .route("/balances", get(balances))
         .route("/balance", get(my_balance))
         .route("/vouch", post(vouch))
+        .route("/revoke", post(revoke))
         .route("/trust", get(trust))
         .route("/names", get(names))
         .route("/name", post(set_name))
@@ -54,6 +66,8 @@ pub fn router(state: AppState) -> Router {
         .route("/messages", get(messages))
         .route("/store", post(store))
         .route("/fetch/{hash}", get(fetch))
+        .route("/verify/{hash}", get(verify))
+        .route("/join-qr.svg", get(join_qr))
         .with_state(state)
 }
 
@@ -163,6 +177,10 @@ struct TrustQuery {
     trusted: bool,
     #[serde(default = "default_depth")]
     depth: u32,
+    /// In trusted views, cap how much total mint a single attester's rewards
+    /// can contribute (0 = uncapped). Blast-radius limit for a rogue voucher.
+    #[serde(default)]
+    mint_cap: u64,
 }
 
 fn default_depth() -> u32 {
@@ -173,7 +191,7 @@ async fn balances(State(s): State<AppState>, Query(q): Query<TrustQuery>) -> Jso
     let dag = s.dag.lock().unwrap();
     if q.trusted {
         let trusted = dag.trusted_set(&s.wallet, q.depth);
-        Json(json!(dag.ledger_view(Some(&trusted)).balances))
+        Json(json!(dag.ledger_view(Some(&trusted), q.mint_cap).balances))
     } else {
         Json(json!(dag.balances()))
     }
@@ -183,7 +201,11 @@ async fn my_balance(State(s): State<AppState>, Query(q): Query<TrustQuery>) -> J
     let dag = s.dag.lock().unwrap();
     let balance = if q.trusted {
         let trusted = dag.trusted_set(&s.wallet, q.depth);
-        dag.ledger_view(Some(&trusted)).balances.get(&s.wallet).copied().unwrap_or(0)
+        dag.ledger_view(Some(&trusted), q.mint_cap)
+            .balances
+            .get(&s.wallet)
+            .copied()
+            .unwrap_or(0)
     } else {
         dag.balance(&s.wallet)
     };
@@ -209,6 +231,21 @@ async fn vouch(
         return bad("cannot vouch for yourself");
     }
     submit(&s, TxKind::Vouch, receiver, 0, 0, String::new()).await
+}
+
+/// Withdraw a previous vouch (latest statement wins on the ledger).
+async fn revoke(
+    State(s): State<AppState>,
+    Json(req): Json<VouchRequest>,
+) -> (StatusCode, Json<Value>) {
+    let receiver = match parse_wallet(&req.to) {
+        Ok(w) => w,
+        Err(e) => return bad(format!("to: {e}")),
+    };
+    if receiver == s.wallet {
+        return bad("cannot revoke yourself");
+    }
+    submit(&s, TxKind::Revoke, receiver, 0, 0, String::new()).await
 }
 
 /// This node's trust neighborhood: wallets within `depth` vouch hops.
@@ -449,6 +486,7 @@ async fn store(
             .await
         {
             Ok(BlobResponse::Stored { hash }) => {
+                let probes = save_probes(&s, &hash, &data);
                 return (
                     StatusCode::OK,
                     Json(json!({
@@ -457,6 +495,7 @@ async fn store(
                         "hash": hash,
                         "price": price,
                         "payment": payment_id,
+                        "custody_probes_saved": probes,
                     })),
                 )
             }
@@ -506,6 +545,113 @@ async fn fetch(
         Ok(BlobResponse::Refused { reason }) => bad(format!("provider refused: {reason}")),
         Ok(other) => internal(format!("unexpected fetch response: {other:?}")),
         Err(e) => bad(e),
+    }
+}
+
+/// Remember hashes of a few random slices so we can later spot-check that a
+/// provider still holds the blob, without keeping the blob ourselves.
+fn save_probes(s: &AppState, hash: &str, data: &[u8]) -> usize {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    let mut probes = Vec::new();
+    let max_len = data.len().min(64);
+    for _ in 0..4 {
+        let len = rng.gen_range(1..=max_len) as u32;
+        let offset = rng.gen_range(0..=(data.len() - len as usize)) as u64;
+        let slice = &data[offset as usize..offset as usize + len as usize];
+        probes.push(Probe {
+            hash: hash.to_string(),
+            offset,
+            len,
+            expected: hex::encode(sha2::Sha256::digest(slice)),
+        });
+    }
+    let path = s.data_dir.join("probes.jsonl");
+    let mut written = 0;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        use std::io::Write as _;
+        for p in &probes {
+            let ok = serde_json::to_writer(&mut f, p).is_ok() && f.write_all(b"\n").is_ok();
+            if ok {
+                written += 1;
+            }
+        }
+    }
+    written
+}
+
+/// Spot-check that a provider still holds a blob: ask for one remembered
+/// random slice and compare its hash. A provider that deleted the data (or
+/// stored only its hash) cannot answer.
+async fn verify(
+    State(s): State<AppState>,
+    Path(hash): Path<String>,
+    Query(q): Query<FetchQuery>,
+) -> (StatusCode, Json<Value>) {
+    let peer: PeerId = match q.peer.parse() {
+        Ok(p) => p,
+        Err(_) => return bad("invalid peer id"),
+    };
+    let probes: Vec<Probe> = std::fs::read_to_string(s.data_dir.join("probes.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .filter(|p: &Probe| p.hash == hash)
+        .collect();
+    let Some(probe) = probes.get(now() as usize % probes.len().max(1)).cloned() else {
+        return bad("no custody probes saved for this hash (was it stored from this node?)");
+    };
+    match blob_roundtrip(
+        &s,
+        peer,
+        BlobRequest::Range { hash: hash.clone(), offset: probe.offset, len: probe.len },
+    )
+    .await
+    {
+        Ok(BlobResponse::RangeData { data }) => {
+            let actual = hex::encode(sha2::Sha256::digest(&data));
+            let ok = actual == probe.expected && data.len() == probe.len as usize;
+            (
+                if ok { StatusCode::OK } else { StatusCode::BAD_GATEWAY },
+                Json(json!({
+                    "hash": hash,
+                    "verified": ok,
+                    "probe": { "offset": probe.offset, "len": probe.len },
+                })),
+            )
+        }
+        Ok(BlobResponse::Refused { reason }) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "hash": hash, "verified": false, "provider_said": reason })),
+        ),
+        Ok(other) => internal(format!("unexpected verify response: {other:?}")),
+        Err(e) => bad(e),
+    }
+}
+
+/// The join file as a scannable QR (SVG), for phones.
+async fn join_qr(State(s): State<AppState>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let listen_addrs = {
+        let (reply, rx) = oneshot::channel();
+        let _ = s.commands.send(Command::ListenAddrs(reply)).await;
+        rx.await.unwrap_or_default()
+    };
+    let bootstrap: Vec<String> = listen_addrs
+        .into_iter()
+        .map(|a| format!("{a}/p2p/{}", s.peer_id))
+        .filter(|a| !a.contains("/127.0.0.1/") && !a.contains("/::1/"))
+        .collect();
+    let join = json!({ "network": s.network, "bootstrap": bootstrap }).to_string();
+    match qrcode::QrCode::new(join.as_bytes()) {
+        Ok(code) => {
+            let svg = code
+                .render::<qrcode::render::svg::Color>()
+                .min_dimensions(240, 240)
+                .build();
+            ([("content-type", "image/svg+xml")], svg).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("QR failed: {e}")).into_response(),
     }
 }
 

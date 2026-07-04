@@ -42,6 +42,9 @@ pub enum TxKind {
     /// Signer (`sender`) states they know and trust the wallet in
     /// `receiver`. No balance effect; feeds the web-of-trust views.
     Vouch,
+    /// Signer withdraws their vouch for `receiver`. For each
+    /// (voucher, vouchee) pair the latest statement wins.
+    Revoke,
     /// Signer sets their own display name (in `memo`). Non-unique label —
     /// the wallet is the identity, the name is decoration. Latest wins.
     Profile,
@@ -109,6 +112,7 @@ impl SigningFields<'_> {
             TxKind::Reward => b"reward",
             TxKind::Transfer => b"transfer",
             TxKind::Vouch => b"vouch",
+            TxKind::Revoke => b"revoke",
             TxKind::Profile => b"profile",
         });
         put(self.sender.as_bytes());
@@ -186,12 +190,12 @@ impl Transaction {
                     bail!("amount must be positive");
                 }
             }
-            TxKind::Vouch | TxKind::Profile => {
+            TxKind::Vouch | TxKind::Revoke | TxKind::Profile => {
                 if self.amount != 0 {
-                    bail!("vouch/profile transactions carry no amount");
+                    bail!("vouch/revoke/profile transactions carry no amount");
                 }
                 if self.seq != 0 {
-                    bail!("vouch/profile transactions carry no sequence number");
+                    bail!("vouch/revoke/profile transactions carry no sequence number");
                 }
             }
         }
@@ -230,12 +234,12 @@ impl Transaction {
                     bail!("rewards carry no sequence number");
                 }
             }
-            TxKind::Vouch => {
+            TxKind::Vouch | TxKind::Revoke => {
                 if signer_wallet != self.sender {
-                    bail!("vouch must be signed by the vouching wallet");
+                    bail!("vouch/revoke must be signed by the vouching wallet");
                 }
                 if signer_wallet == self.receiver {
-                    bail!("cannot vouch for yourself");
+                    bail!("cannot vouch for/revoke yourself");
                 }
             }
             TxKind::Profile => {
@@ -480,26 +484,45 @@ impl Dag {
     ///    ordering. An unfunded transfer (modified client) simply never
     ///    applies — balances cannot go negative.
     pub fn ledger(&self) -> LedgerState {
-        self.ledger_view(None)
+        self.ledger_view(None, 0)
     }
 
     /// Like [`Dag::ledger`], but when `trusted` is given, only rewards minted
     /// by a wallet in the trusted set (plus genesis) are counted — "balances
     /// as seen by me, counting only coins vouched-for people created".
-    /// Transfers behave identically; they just can't be funded by untrusted
-    /// mints. Deterministic for a given (DAG, trusted set).
-    pub fn ledger_view(&self, trusted: Option<&BTreeMap<String, u32>>) -> LedgerState {
+    /// `mint_cap` > 0 additionally limits how much total mint any single
+    /// attester's rewards contribute (blast-radius limit for a compromised
+    /// or colluding vouched wallet); rewards are considered in (timestamp,
+    /// id) order so the cap is a pure function of the set. Transfers behave
+    /// identically; they just can't be funded by uncounted mints.
+    pub fn ledger_view(&self, trusted: Option<&BTreeMap<String, u32>>, mint_cap: u64) -> LedgerState {
         let mut balances: BTreeMap<String, i64> = BTreeMap::new();
-        for tx in self.transactions.values() {
-            if tx.kind == TxKind::Reward {
-                let counted = match trusted {
-                    None => true,
-                    Some(set) => tx.is_genesis() || set.contains_key(&tx.sender),
-                };
-                if counted {
-                    *balances.entry(tx.receiver.clone()).or_default() += tx.amount as i64;
-                }
+        let mut rewards: Vec<&Transaction> = self
+            .transactions
+            .values()
+            .filter(|t| t.kind == TxKind::Reward)
+            .collect();
+        rewards.sort_by(|a, b| (a.timestamp, &a.id).cmp(&(b.timestamp, &b.id)));
+        let mut minted_by: HashMap<&str, u64> = HashMap::new();
+        for tx in rewards {
+            // Genesis marker: an empty public key is only insertable when the
+            // id matches the network's known genesis transactions.
+            let genesis = tx.public_key.is_empty();
+            let counted = match trusted {
+                None => true,
+                Some(set) => genesis || set.contains_key(&tx.sender),
+            };
+            if !counted {
+                continue;
             }
+            if mint_cap > 0 && !genesis {
+                let so_far = minted_by.entry(tx.sender.as_str()).or_default();
+                if *so_far + tx.amount > mint_cap {
+                    continue;
+                }
+                *so_far += tx.amount;
+            }
+            *balances.entry(tx.receiver.clone()).or_default() += tx.amount as i64;
         }
 
         // Winner per (sender, seq): lowest id.
@@ -554,9 +577,27 @@ impl Dag {
     /// depth 0, everyone the viewer vouched for at 1, everyone *they*
     /// vouched for at 2, … up to `max_depth` hops (BFS over vouch edges).
     pub fn trusted_set(&self, viewer: &str, max_depth: u32) -> BTreeMap<String, u32> {
+        // For each (voucher, vouchee) pair, the latest vouch/revoke wins.
+        let mut latest: HashMap<(&str, &str), &Transaction> = HashMap::new();
+        for tx in self
+            .transactions
+            .values()
+            .filter(|t| matches!(t.kind, TxKind::Vouch | TxKind::Revoke))
+        {
+            latest
+                .entry((tx.sender.as_str(), tx.receiver.as_str()))
+                .and_modify(|cur| {
+                    if (tx.timestamp, &tx.id) > (cur.timestamp, &cur.id) {
+                        *cur = tx;
+                    }
+                })
+                .or_insert(tx);
+        }
         let mut edges: HashMap<&str, Vec<&str>> = HashMap::new();
-        for tx in self.transactions.values().filter(|t| t.kind == TxKind::Vouch) {
-            edges.entry(tx.sender.as_str()).or_default().push(tx.receiver.as_str());
+        for ((voucher, vouchee), tx) in latest {
+            if tx.kind == TxKind::Vouch {
+                edges.entry(voucher).or_default().push(vouchee);
+            }
         }
         let mut trusted: BTreeMap<String, u32> = BTreeMap::new();
         trusted.insert(viewer.to_string(), 0);
@@ -846,8 +887,73 @@ mod tests {
 
         assert_eq!(dag.balance(&wallet_of(&worker)), 1010); // raw view
         let trusted = dag.trusted_set(&wallet_of(&me), 3);
-        let view = dag.ledger_view(Some(&trusted));
+        let view = dag.ledger_view(Some(&trusted), 0);
         assert_eq!(view.balances.get(&wallet_of(&worker)), Some(&10)); // my view
+    }
+
+    #[test]
+    fn revoke_cuts_the_trust_edge_and_its_subtree() {
+        let me = keypair();
+        let friend = keypair();
+        let their_friend = keypair();
+        let mut dag = Dag::new(NET);
+        dag.insert(vouch(&dag, &me, &wallet_of(&friend))).unwrap();
+        dag.insert(vouch(&dag, &friend, &wallet_of(&their_friend))).unwrap();
+        assert!(dag.trusted_set(&wallet_of(&me), 3).contains_key(&wallet_of(&their_friend)));
+
+        // I withdraw my vouch (later timestamp wins).
+        let revoke = Transaction::create(
+            TxKind::Revoke,
+            &me,
+            wallet_of(&me),
+            wallet_of(&friend),
+            0,
+            0,
+            String::new(),
+            dag.tips(),
+            99,
+        )
+        .unwrap();
+        dag.insert(revoke).unwrap();
+        let trusted = dag.trusted_set(&wallet_of(&me), 3);
+        assert!(!trusted.contains_key(&wallet_of(&friend)));
+        assert!(!trusted.contains_key(&wallet_of(&their_friend)));
+        assert_eq!(trusted.len(), 1); // just me
+    }
+
+    #[test]
+    fn mint_cap_limits_a_single_attesters_blast_radius() {
+        let me = keypair();
+        let friend = keypair();
+        let mut dag = Dag::new(NET);
+        dag.insert(vouch(&dag, &me, &wallet_of(&friend))).unwrap();
+        // Trusted friend goes rogue and mints 3 × 400 to an accomplice.
+        for ts in [10, 20, 30] {
+            let tx = Transaction::create(
+                TxKind::Reward,
+                &friend,
+                wallet_of(&friend),
+                "0xaccomplice".into(),
+                400,
+                0,
+                "rogue".into(),
+                dag.tips(),
+                ts,
+            )
+            .unwrap();
+            dag.insert(tx).unwrap();
+        }
+        let trusted = dag.trusted_set(&wallet_of(&me), 3);
+        // Uncapped trusted view counts all 1200.
+        assert_eq!(
+            dag.ledger_view(Some(&trusted), 0).balances.get("0xaccomplice"),
+            Some(&1200)
+        );
+        // With a 1000 cap, only the first two rewards (800) fit.
+        assert_eq!(
+            dag.ledger_view(Some(&trusted), 1000).balances.get("0xaccomplice"),
+            Some(&800)
+        );
     }
 
     #[test]
