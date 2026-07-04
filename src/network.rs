@@ -13,7 +13,7 @@ use crate::dag::{wallet_address, Dag, Transaction, TxKind};
 use anyhow::{anyhow, Result};
 use futures::StreamExt;
 use libp2p::{
-    autonat, dcutr, gossipsub, identify, mdns, noise, ping, relay,
+    autonat, dcutr, gossipsub, identify, kad, mdns, noise, ping, relay,
     request_response::{self, OutboundRequestId, ProtocolSupport, ResponseChannel},
     swarm::{behaviour::toggle::Toggle, NetworkBehaviour, SwarmEvent},
     upnp, yamux, Multiaddr, PeerId, StreamProtocol, Swarm,
@@ -75,6 +75,8 @@ pub enum BlobRequest {
     },
     /// Fetch a blob by its sha256 hex hash.
     Get { hash: String },
+    /// Custody spot-check: return `len` bytes of the blob at `offset`.
+    Range { hash: String, offset: u64, len: u32 },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,6 +87,10 @@ pub enum BlobResponse {
         #[serde(with = "serde_bytes")]
         data: Vec<u8>,
     },
+    RangeData {
+        #[serde(with = "serde_bytes")]
+        data: Vec<u8>,
+    },
     Refused { reason: String },
 }
 
@@ -92,6 +98,7 @@ pub enum BlobResponse {
 #[derive(Debug, Clone, Serialize)]
 pub struct InboxMessage {
     pub from: String,
+    pub from_wallet: String,
     pub text: String,
     pub received_at: u64,
 }
@@ -111,6 +118,7 @@ pub struct Behaviour {
     relay_client: relay::client::Behaviour,
     dcutr: dcutr::Behaviour,
     upnp: upnp::tokio::Behaviour,
+    kad: kad::Behaviour<kad::store::MemoryStore>,
     sync: request_response::cbor::Behaviour<SyncRequest, SyncResponse>,
     msg: request_response::cbor::Behaviour<MsgRequest, MsgResponse>,
     blob: request_response::cbor::Behaviour<BlobRequest, BlobResponse>,
@@ -135,6 +143,10 @@ pub struct Config {
     pub blob_price: u64,
     /// Largest blob this node will store for others.
     pub blob_max_bytes: u64,
+    /// When > 0, accept storage payments only from wallets within this many
+    /// vouch hops of ours — rigged coin from outside the neighborhood buys
+    /// nothing here.
+    pub blob_trust_depth: u32,
 }
 
 impl Config {
@@ -177,6 +189,7 @@ impl Network {
         let sync_proto = proto(&config.network, "sync/1.1.0")?;
         let msg_proto = proto(&config.network, "msg/1.0.0")?;
         let blob_proto = proto(&config.network, "blob/1.0.0")?;
+        let kad_proto = proto(&config.network, "kad/1.0.0")?;
         let identify_proto = format!("/timecoin/{}/1.0.0", config.network);
         let enable_mdns = config.enable_mdns;
 
@@ -223,6 +236,17 @@ impl Network {
 
                 let rr = |p: StreamProtocol| ([(p, ProtocolSupport::Full)], Default::default());
 
+                // Peer discovery beyond the bootstrap list: a DHT under our
+                // own protocol id. Server mode so every node contributes
+                // routing; the table doubles as the address book for dialing
+                // peers-of-peers by id (messages, blobs).
+                let mut kad = kad::Behaviour::with_config(
+                    local_peer_id,
+                    kad::store::MemoryStore::new(local_peer_id),
+                    kad::Config::new(kad_proto.clone()),
+                );
+                kad.set_mode(Some(kad::Mode::Server));
+
                 Ok(Behaviour {
                     gossipsub,
                     mdns,
@@ -233,6 +257,7 @@ impl Network {
                     relay_client,
                     dcutr: dcutr::Behaviour::new(local_peer_id),
                     upnp: upnp::tokio::Behaviour::default(),
+                    kad,
                     sync: {
                         let (p, c) = rr(sync_proto.clone());
                         request_response::cbor::Behaviour::new(p, c)
@@ -333,6 +358,9 @@ impl Network {
     }
 
     pub async fn run(mut self) {
+        // Refresh DHT routing periodically so the mesh heals as peers churn.
+        let mut kad_refresh = tokio::time::interval(Duration::from_secs(300));
+        kad_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 command = self.commands.recv() => match command {
@@ -340,6 +368,11 @@ impl Network {
                     None => return,
                 },
                 event = self.swarm.select_next_some() => self.handle_event(event),
+                _ = kad_refresh.tick() => {
+                    if self.swarm.behaviour_mut().kad.bootstrap().is_err() {
+                        debug!("kad bootstrap skipped: no known peers yet");
+                    }
+                }
             }
         }
     }
@@ -445,23 +478,57 @@ impl Network {
         match request {
             BlobRequest::Quote { size } => {
                 if size > self.config.blob_max_bytes {
-                    BlobResponse::Refused {
+                    return BlobResponse::Refused {
                         reason: format!(
                             "blob too large: {size} > {} bytes",
                             self.config.blob_max_bytes
                         ),
-                    }
-                } else {
-                    BlobResponse::Price { price: self.config.quote(size) }
+                    };
                 }
+                // Refuse untrusted requesters at quote time, before they
+                // burn a payment that Put would reject anyway.
+                if self.config.blob_trust_depth > 0 {
+                    let requester = wallet_address(&peer);
+                    let trusted = self
+                        .dag
+                        .lock()
+                        .unwrap()
+                        .trusted_set(&self.wallet, self.config.blob_trust_depth);
+                    if !trusted.contains_key(&requester) {
+                        return BlobResponse::Refused {
+                            reason: format!(
+                                "you are outside this node's trust neighborhood (depth {}) — ask the operator to vouch for you",
+                                self.config.blob_trust_depth
+                            ),
+                        };
+                    }
+                }
+                BlobResponse::Price { price: self.config.quote(size) }
             }
             BlobRequest::Put { data, payment } => self.handle_blob_put(peer, data, payment),
             BlobRequest::Get { hash } => {
-                if !hash.chars().all(|c| c.is_ascii_hexdigit()) || hash.len() != 64 {
+                if !valid_hash(&hash) {
                     return BlobResponse::Refused { reason: "invalid hash".into() };
                 }
                 match std::fs::read(self.blob_dir().join(&hash)) {
                     Ok(data) => BlobResponse::Blob { data },
+                    Err(_) => BlobResponse::Refused { reason: "not found".into() },
+                }
+            }
+            BlobRequest::Range { hash, offset, len } => {
+                if !valid_hash(&hash) || len > 4096 {
+                    return BlobResponse::Refused { reason: "invalid range request".into() };
+                }
+                match std::fs::read(self.blob_dir().join(&hash)) {
+                    Ok(data) => {
+                        let start = offset as usize;
+                        let end = start.saturating_add(len as usize);
+                        if end > data.len() {
+                            BlobResponse::Refused { reason: "range out of bounds".into() }
+                        } else {
+                            BlobResponse::RangeData { data: data[start..end].to_vec() }
+                        }
+                    }
                     Err(_) => BlobResponse::Refused { reason: "not found".into() },
                 }
             }
@@ -515,8 +582,27 @@ impl Network {
         if tx.amount < price {
             return Err(format!("payment {} < price {price}", tx.amount));
         }
-        if !dag.ledger().applied_transfers.contains(payment) {
-            return Err("payment not (yet) applied by the ledger — retry".into());
+        // Trust gate: the payer must be inside our vouch neighborhood, and
+        // the payment must be funded when counting only trusted mints —
+        // coin rigged up outside the neighborhood buys nothing here.
+        let (ledger, gated) = if self.config.blob_trust_depth > 0 {
+            let trusted = dag.trusted_set(&self.wallet, self.config.blob_trust_depth);
+            if !trusted.contains_key(&tx.sender) {
+                return Err(format!(
+                    "payer is outside this node's trust neighborhood (depth {}) — ask the operator to vouch for you",
+                    self.config.blob_trust_depth
+                ));
+            }
+            (dag.ledger_view(Some(&trusted), 0), true)
+        } else {
+            (dag.ledger(), false)
+        };
+        if !ledger.applied_transfers.contains(payment) {
+            return Err(if gated {
+                "payment not applied in this node's trusted ledger view — retry, or the coins aren't trusted here".into()
+            } else {
+                "payment not (yet) applied by the ledger — retry".into()
+            });
         }
         Ok(())
     }
@@ -546,6 +632,8 @@ impl Network {
                     .behaviour_mut()
                     .sync
                     .send_request(&peer_id, SyncRequest::Tips);
+                // Learn this peer's neighbors so we can reach peers-of-peers.
+                let _ = self.swarm.behaviour_mut().kad.bootstrap();
             }
             SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
                 if num_established == 0 {
@@ -556,10 +644,19 @@ impl Network {
             SwarmEvent::Behaviour(BehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
                 for (peer_id, addr) in list {
                     debug!("mDNS discovered {peer_id} at {addr}");
+                    self.swarm.behaviour_mut().kad.add_address(&peer_id, addr.clone());
                     if let Err(e) = self.swarm.dial(addr.clone()) {
                         debug!("mDNS dial {addr}: {e}");
                     }
                 }
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::Kad(kad::Event::RoutingUpdated {
+                peer, ..
+            })) => {
+                debug!("kad routing table gained {peer}");
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::Kad(event)) => {
+                debug!("kad: {event:?}");
             }
             SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(gossipsub::Event::Message {
                 propagation_source,
@@ -594,10 +691,12 @@ impl Network {
                 ..
             })) => {
                 debug!("identify from {peer_id}: {}", info.protocol_version);
-                // Remember the peer's addresses so later direct requests
-                // (messages, blobs) can dial it again after a disconnect.
+                // Remember the peer's addresses (swarm book + DHT routing
+                // table) so direct requests can dial it later and other
+                // peers can discover it through us.
                 for addr in info.listen_addrs {
-                    self.swarm.add_peer_address(peer_id, addr);
+                    self.swarm.add_peer_address(peer_id, addr.clone());
+                    self.swarm.behaviour_mut().kad.add_address(&peer_id, addr);
                 }
             }
             SwarmEvent::Behaviour(BehaviourEvent::Autonat(event)) => {
@@ -631,6 +730,7 @@ impl Network {
                         } else {
                             inbox.push(InboxMessage {
                                 from: peer.to_string(),
+                                from_wallet: wallet_address(&peer),
                                 text: request.text,
                                 received_at: now(),
                             });
@@ -680,6 +780,10 @@ impl Network {
             _ => {}
         }
     }
+}
+
+fn valid_hash(hash: &str) -> bool {
+    hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 fn now() -> u64 {

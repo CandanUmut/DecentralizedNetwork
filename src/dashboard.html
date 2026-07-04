@@ -2,93 +2,211 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>TimeCoin node</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>TimeCoin</title>
 <style>
   :root { color-scheme: light dark;
-    --fg: #1a1d21; --bg: #fafafa; --card: #ffffff; --line: #e2e5e9; --dim: #6b7280;
-    --ok: #16794c; --dead: #a33; }
+    --fg:#1a1d21; --bg:#f4f5f7; --card:#fff; --line:#e2e5e9; --dim:#6b7280;
+    --acc:#0f766e; --acc-fg:#fff; --ok:#16794c; --dead:#a33; }
   @media (prefers-color-scheme: dark) {
-    :root { --fg: #e6e8ea; --bg: #131518; --card: #1c1f24; --line: #2c3138; --dim: #9aa3ad; }
+    :root { --fg:#e6e8ea; --bg:#101214; --card:#1b1e22; --line:#2c3138; --dim:#9aa3ad;
+            --acc:#14b8a6; --acc-fg:#06251f; }
   }
-  * { box-sizing: border-box; }
-  body { margin: 0; padding: 1.25rem; font: 14px/1.5 system-ui, sans-serif;
-         color: var(--fg); background: var(--bg); }
-  h1 { font-size: 1.1rem; margin: 0 0 1rem; }
-  h1 small { color: var(--dim); font-weight: normal; }
-  .tiles { display: flex; flex-wrap: wrap; gap: .75rem; margin-bottom: 1rem; }
-  .tile { background: var(--card); border: 1px solid var(--line); border-radius: 8px;
-          padding: .6rem 1rem; min-width: 8rem; }
-  .tile b { display: block; font-size: 1.4rem; font-variant-numeric: tabular-nums; }
-  .tile span { color: var(--dim); font-size: .8rem; }
-  section { background: var(--card); border: 1px solid var(--line); border-radius: 8px;
-            padding: .75rem 1rem; margin-bottom: 1rem; overflow-x: auto; }
-  section h2 { font-size: .85rem; margin: 0 0 .5rem; color: var(--dim);
-               text-transform: uppercase; letter-spacing: .04em; }
-  table { border-collapse: collapse; width: 100%; white-space: nowrap; }
-  td, th { text-align: left; padding: .25rem .75rem .25rem 0; border-top: 1px solid var(--line);
-           font-variant-numeric: tabular-nums; }
-  th { border-top: none; color: var(--dim); font-weight: 500; font-size: .8rem; }
-  code { font-size: .85em; color: var(--dim); }
-  .ok { color: var(--ok); } .dead { color: var(--dead); }
-  #me { color: var(--dim); font-size: .8rem; word-break: break-all; margin-bottom: 1rem; }
+  * { box-sizing:border-box; }
+  html,body { margin:0; }
+  body { font:16px/1.5 system-ui,sans-serif; color:var(--fg); background:var(--bg);
+         padding-bottom:calc(3.6rem + env(safe-area-inset-bottom)); }
+  header { padding:1rem 1rem .75rem; background:var(--card); border-bottom:1px solid var(--line); }
+  header h1 { margin:0; font-size:1rem; display:flex; justify-content:space-between; align-items:baseline; }
+  header h1 small { color:var(--dim); font-weight:normal; }
+  #hero { font-size:2rem; font-weight:700; font-variant-numeric:tabular-nums; }
+  #hero small { font-size:.8rem; color:var(--dim); font-weight:normal; }
+  #me { color:var(--dim); font-size:.75rem; word-break:break-all; }
+  main { padding:1rem; max-width:640px; margin:0 auto; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px;
+          padding:1rem; margin-bottom:1rem; }
+  .card h2 { font-size:.8rem; margin:0 0 .6rem; color:var(--dim); text-transform:uppercase; letter-spacing:.05em; }
+  table { border-collapse:collapse; width:100%; }
+  td,th { text-align:left; padding:.35rem .5rem .35rem 0; border-top:1px solid var(--line);
+          font-variant-numeric:tabular-nums; overflow-wrap:anywhere; }
+  th { border-top:none; color:var(--dim); font-weight:500; font-size:.75rem; }
+  code { font-size:.8em; color:var(--dim); }
+  .ok{color:var(--ok);} .dead{color:var(--dead);}
+  label { display:block; font-size:.8rem; color:var(--dim); margin:.6rem 0 .2rem; }
+  input,select,textarea { width:100%; font:inherit; color:inherit; background:var(--bg);
+    border:1px solid var(--line); border-radius:8px; padding:.6rem .7rem; }
+  button { font:inherit; font-weight:600; border:0; border-radius:10px; padding:.7rem 1rem;
+    background:var(--acc); color:var(--acc-fg); width:100%; margin-top:.8rem; }
+  button:active { opacity:.8; }
+  nav { position:fixed; bottom:0; left:0; right:0; display:flex; background:var(--card);
+    border-top:1px solid var(--line); padding-bottom:env(safe-area-inset-bottom); }
+  nav button { flex:1; background:none; color:var(--dim); border-radius:0; margin:0;
+    padding:.8rem 0; font-size:.8rem; font-weight:500; }
+  nav button.on { color:var(--acc); font-weight:700; }
+  .tab { display:none; } .tab.on { display:block; }
+  #toast { position:fixed; left:50%; bottom:4.5rem; transform:translateX(-50%);
+    background:var(--fg); color:var(--bg); padding:.6rem 1rem; border-radius:10px;
+    max-width:90vw; font-size:.85rem; opacity:0; transition:opacity .25s; pointer-events:none; }
+  #qr { width:100%; max-width:280px; display:block; margin:.5rem auto; background:#fff;
+    padding:8px; border-radius:12px; }
+  .addr { font-size:.72rem; color:var(--dim); word-break:break-all; margin:.3rem 0; }
+  .row2 { display:flex; gap:.6rem; } .row2 > * { flex:1; }
 </style>
 </head>
 <body>
-<h1>TimeCoin node <small id="net"></small></h1>
-<div id="me"></div>
-<div class="tiles">
-  <div class="tile"><b id="balance">–</b><span>my balance</span></div>
-  <div class="tile"><b id="trusted_balance">–</b><span>trusted-view balance</span></div>
-  <div class="tile"><b id="peer_count">–</b><span>connected peers</span></div>
-  <div class="tile"><b id="tx_count">–</b><span>DAG transactions</span></div>
-  <div class="tile"><b id="tip_count">–</b><span>DAG tips</span></div>
-  <div class="tile"><b id="inbox_count">–</b><span>inbox</span></div>
-</div>
-<section><h2>Balances</h2><table id="balances"></table></section>
-<section><h2>Latest transactions</h2><table id="txs"></table></section>
-<section><h2>Connected peers</h2><table id="peers"></table></section>
+<header>
+  <h1><span>TimeCoin</span> <small id="net"></small></h1>
+  <div id="hero">– <small>TC (trusted view; raw: <span id="raw">–</span>)</small></div>
+  <div id="me"></div>
+</header>
+<main>
+  <div id="tab-home" class="tab on">
+    <div class="card"><h2>Balances (trusted view <input type="checkbox" id="trusted_toggle" checked style="width:auto">)</h2>
+      <table id="balances"></table></div>
+    <div class="card"><h2>Activity</h2><table id="txs"></table></div>
+    <div class="card"><h2>Connected peers (<span id="peer_count">0</span>)</h2><table id="peers"></table></div>
+  </div>
+
+  <div id="tab-act" class="tab">
+    <div class="card"><h2>Thank someone (mints TimeCoin to them)</h2>
+      <form data-post="/reward">
+        <label>Who helped you (name, wallet, or peer id)</label>
+        <input name="to" list="known" required placeholder="nova / 0x… / 12D3Koo…">
+        <div class="row2"><div><label>Amount</label><input name="amount" type="number" min="1" required></div>
+        <div><label>For what</label><input name="memo" placeholder="fixed my bike"></div></div>
+        <button>Thank & mint</button>
+      </form></div>
+    <div class="card"><h2>Send TimeCoin</h2>
+      <form data-post="/send">
+        <label>To</label><input name="to" list="known" required>
+        <label>Amount</label><input name="amount" type="number" min="1" required>
+        <button>Send</button>
+      </form></div>
+    <div class="card"><h2>Vouch (I know & trust this person)</h2>
+      <form data-post="/vouch">
+        <label>Wallet or peer id</label><input name="to" list="known" required>
+        <button>Vouch</button>
+      </form>
+      <form data-post="/revoke">
+        <label>Withdraw a vouch</label><input name="to" list="known" required>
+        <button style="background:var(--dead)">Revoke</button>
+      </form></div>
+    <div class="card"><h2>My name</h2>
+      <form data-post="/name">
+        <input name="name" maxlength="32" required placeholder="how others see you">
+        <button>Set name</button>
+      </form></div>
+  </div>
+
+  <div id="tab-chat" class="tab">
+    <div class="card"><h2>Send a message (encrypted, direct)</h2>
+      <form data-post="/message">
+        <label>Peer</label><select name="peer_id" id="msg_peer"></select>
+        <label>Message</label><textarea name="text" rows="2" required></textarea>
+        <button>Send</button>
+      </form></div>
+    <div class="card"><h2>Inbox</h2><table id="inbox"></table></div>
+  </div>
+
+  <div id="tab-join" class="tab">
+    <div class="card"><h2>Invite someone — scan or share</h2>
+      <img id="qr" src="/join-qr.svg" alt="join QR">
+      <p class="addr">The QR contains this community's join file. On their machine:<br>
+      <code>timecoin-node run --config join.json</code></p>
+      <div id="addrs"></div></div>
+  </div>
+</main>
+<datalist id="known"></datalist>
+<nav>
+  <button data-tab="home" class="on">Home</button>
+  <button data-tab="act">Act</button>
+  <button data-tab="chat">Chat</button>
+  <button data-tab="join">Join</button>
+</nav>
+<div id="toast"></div>
 <script>
 const $ = id => document.getElementById(id);
 const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-const short = s => s.length > 20 ? s.slice(0, 10) + '…' + s.slice(-6) : s;
+const short = s => s && s.length > 18 ? s.slice(0, 8) + '…' + s.slice(-4) : (s || '');
+let NAMES = {}, WALLETS_BY_NAME = {};
+const label = w => NAMES[w] ? `${NAMES[w]}` : short(w);
+
+function toast(msg, bad) {
+  const t = $('toast'); t.textContent = msg; t.style.opacity = 1;
+  t.style.background = bad ? 'var(--dead)' : 'var(--fg)';
+  setTimeout(() => t.style.opacity = 0, 2600);
+}
+
+document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
+  document.querySelectorAll('nav button').forEach(x => x.classList.toggle('on', x === b));
+  document.querySelectorAll('.tab').forEach(x => x.classList.toggle('on', x.id === 'tab-' + b.dataset.tab));
+});
+
+// Forms: names/labels typed by users are resolved to wallets when they match
+// a known display name.
+document.querySelectorAll('form[data-post]').forEach(f => f.onsubmit = async e => {
+  e.preventDefault();
+  const body = Object.fromEntries(new FormData(f).entries());
+  if (body.amount) body.amount = Number(body.amount);
+  if (body.to && WALLETS_BY_NAME[body.to.toLowerCase()]) body.to = WALLETS_BY_NAME[body.to.toLowerCase()];
+  try {
+    const r = await fetch(f.dataset.post, { method:'POST',
+      headers:{'content-type':'application/json'}, body: JSON.stringify(body) });
+    const j = await r.json();
+    if (r.ok) { toast('done ✓'); f.reset(); refresh(); }
+    else toast(j.error || 'failed', true);
+  } catch (err) { toast('node unreachable', true); }
+});
 
 async function refresh() {
   try {
-    const [st, bal, txs, names, tbal] = await Promise.all(
-      ['/status', '/balances', '/transactions', '/names', '/balance?trusted=true']
-        .map(u => fetch(u).then(r => r.json())));
-    const label = w => names[w] ? `${names[w]} · ${short(w)}` : short(w);
+    const trusted = $('trusted_toggle').checked;
+    const [st, bal, txs, names, tbal, inbox] = await Promise.all(
+      ['/status', `/balances?trusted=${trusted}`, '/transactions', '/names',
+       '/balance?trusted=true', '/messages'].map(u => fetch(u).then(r => r.json())));
 
-    $('net').textContent = `· network “${st.network}”`;
-    $('me').textContent = `peer ${st.peer_id} · wallet ${st.wallet}`;
-    $('balance').textContent = st.balance;
-    $('trusted_balance').textContent = tbal.balance;
+    NAMES = names;
+    WALLETS_BY_NAME = Object.fromEntries(Object.entries(names).map(([w, n]) => [n.toLowerCase(), w]));
+    $('known').innerHTML = Object.entries(names)
+      .map(([w, n]) => `<option value="${esc(n)}">`).join('') +
+      Object.keys(bal).filter(w => w.startsWith('0x'))
+      .map(w => `<option value="${esc(w)}">`).join('');
+
+    $('net').textContent = `network “${st.network}”`;
+    $('hero').firstChild.textContent = tbal.balance + ' ';
+    $('raw').textContent = st.balance;
+    $('me').textContent = `${NAMES[st.wallet] ? NAMES[st.wallet] + ' · ' : ''}peer ${short(st.peer_id)} · wallet ${short(st.wallet)}`;
     $('peer_count').textContent = st.peer_count;
-    $('tx_count').textContent = st.dag_transactions;
-    $('tip_count').textContent = st.dag_tips;
-    $('inbox_count').textContent = st.inbox_count;
 
-    $('balances').innerHTML = '<tr><th>wallet</th><th>balance</th></tr>' +
+    $('balances').innerHTML = '<tr><th>who</th><th>TC</th></tr>' +
       Object.entries(bal).map(([w, b]) =>
-        `<tr><td><code title="${esc(w)}">${esc(label(w))}${w === st.wallet ? ' (me)' : ''}</code></td><td>${b}</td></tr>`).join('');
+        `<tr><td title="${esc(w)}">${esc(label(w))}${w === st.wallet ? ' (me)' : ''}</td><td>${b}</td></tr>`).join('');
 
-    $('txs').innerHTML = '<tr><th>kind</th><th>from</th><th>to</th><th>amount</th><th>memo</th><th>state</th></tr>' +
-      txs.slice(-15).reverse().map(t =>
-        `<tr><td>${esc(t.kind)}</td><td><code title="${esc(t.sender)}">${esc(label(t.sender))}</code></td>` +
-        `<td><code title="${esc(t.receiver)}">${esc(label(t.receiver))}</code></td><td>${t.amount}</td>` +
-        `<td>${esc(t.memo || '')}</td>` +
-        `<td class="${t.applied ? 'ok' : 'dead'}">${t.applied ? 'applied' : 'not applied'}</td></tr>`).join('');
+    $('txs').innerHTML = '<tr><th>what</th><th>from</th><th>to</th><th>TC</th><th></th></tr>' +
+      txs.slice(-12).reverse().map(t =>
+        `<tr><td>${esc(t.kind)}${t.memo ? ' · ' + esc(t.memo) : ''}</td>` +
+        `<td title="${esc(t.sender)}">${esc(label(t.sender))}</td>` +
+        `<td title="${esc(t.receiver)}">${esc(label(t.receiver))}</td>` +
+        `<td>${t.amount || ''}</td>` +
+        `<td class="${t.applied ? 'ok' : 'dead'}">${t.kind === 'transfer' ? (t.applied ? '✓' : '✗') : ''}</td></tr>`).join('');
 
-    $('peers').innerHTML = st.connected_peers.length
-      ? st.connected_peers.map(p => `<tr><td><code>${esc(p)}</code></td></tr>`).join('')
-      : '<tr><td class="dead">no peers connected</td></tr>';
-  } catch (e) {
-    $('me').textContent = 'node unreachable: ' + e;
-  }
+    $('peers').innerHTML = st.connected_peers.map(p => `<tr><td><code>${esc(p)}</code></td></tr>`).join('')
+      || '<tr><td class="dead">alone — share the Join tab with someone</td></tr>';
+    $('msg_peer').innerHTML = st.connected_peers
+      .map(p => `<option value="${esc(p)}">${esc(label(nameOfPeerWallet(p)) || short(p))}</option>`).join('');
+
+    $('inbox').innerHTML = inbox.slice(-20).reverse().map(m =>
+      `<tr><td title="${esc(m.from_wallet)}">${esc(label(m.from_wallet))}</td><td>${esc(m.text)}</td></tr>`).join('')
+      || '<tr><td class="dead">no messages yet</td></tr>';
+
+    $('addrs').innerHTML = st.listen_addrs.map(a => `<div class="addr">${esc(a)}</div>`).join('');
+  } catch (e) { $('me').textContent = 'node unreachable'; }
 }
+// We can't derive a wallet from a peer id in the browser; show the peer id.
+function nameOfPeerWallet() { return null; }
+$('trusted_toggle').onchange = refresh;
 refresh();
-setInterval(refresh, 2000);
+setInterval(refresh, 3000);
 </script>
 </body>
 </html>

@@ -62,6 +62,10 @@ enum CliCommand {
         /// Largest blob (KiB) this node stores for others.
         #[arg(long, default_value_t = 512)]
         blob_max_kib: u64,
+        /// Accept storage payments only from wallets within this many vouch
+        /// hops (0 = accept anyone's coin).
+        #[arg(long, default_value_t = 0)]
+        blob_trust_depth: u32,
     },
     /// Show a running node's status (peers, DAG tips, balance).
     Status {
@@ -104,6 +108,13 @@ enum CliCommand {
         #[arg(long, default_value = "127.0.0.1:3000")]
         api: String,
         /// Wallet (0x…) or peer id you vouch for.
+        #[arg(long)]
+        to: String,
+    },
+    /// Withdraw a previous vouch.
+    Revoke {
+        #[arg(long, default_value = "127.0.0.1:3000")]
+        api: String,
         #[arg(long)]
         to: String,
     },
@@ -161,6 +172,15 @@ enum CliCommand {
         #[arg(long)]
         hash: String,
     },
+    /// Spot-check that a provider still holds a blob you stored.
+    Verify {
+        #[arg(long, default_value = "127.0.0.1:3000")]
+        api: String,
+        #[arg(long)]
+        peer: String,
+        #[arg(long)]
+        hash: String,
+    },
 }
 
 /// A community join file: everything a friend needs to join your network.
@@ -194,6 +214,7 @@ async fn main() -> Result<()> {
             no_mdns,
             blob_price,
             blob_max_kib,
+            blob_trust_depth,
         } => {
             if let Some(path) = config {
                 let join: JoinFile = serde_json::from_str(
@@ -211,6 +232,7 @@ async fn main() -> Result<()> {
                 data_dir: data_dir.clone(),
                 blob_price,
                 blob_max_bytes: blob_max_kib * 1024,
+                blob_trust_depth,
             };
             run(data_dir, port, api, bootstrap, relay, external_address, config).await
         }
@@ -221,6 +243,9 @@ async fn main() -> Result<()> {
         CliCommand::Inbox { api } => print_json(&get(&api, "/messages")?),
         CliCommand::Vouch { api, to } => {
             print_json(&post(&api, "/vouch", serde_json::json!({"to": to}))?)
+        }
+        CliCommand::Revoke { api, to } => {
+            print_json(&post(&api, "/revoke", serde_json::json!({"to": to}))?)
         }
         CliCommand::Trust { api, depth } => print_json(&get(&api, &format!("/trust?depth={depth}"))?),
         CliCommand::Name { api, set } => {
@@ -266,6 +291,9 @@ async fn main() -> Result<()> {
         CliCommand::Fetch { api, peer, hash } => {
             print_json(&get(&api, &format!("/fetch/{hash}?peer={peer}"))?)
         }
+        CliCommand::Verify { api, peer, hash } => {
+            print_json(&get(&api, &format!("/verify/{hash}?peer={peer}"))?)
+        }
     }
 }
 
@@ -309,6 +337,7 @@ async fn run(
         peer_id,
         wallet,
         network: network_name,
+        data_dir,
     };
     let listener = tokio::net::TcpListener::bind(&api_addr)
         .await
@@ -329,10 +358,12 @@ async fn run(
 }
 
 fn get(api: &str, path: &str) -> Result<serde_json::Value> {
-    Ok(ureq::get(&format!("http://{api}{path}"))
-        .call()
-        .with_context(|| format!("is a node running with --api {api}?"))?
-        .into_json()?)
+    match ureq::get(&format!("http://{api}{path}")).call() {
+        Ok(resp) => Ok(resp.into_json()?),
+        // Surface the node's JSON error body instead of a bare HTTP status.
+        Err(ureq::Error::Status(_, resp)) => Ok(resp.into_json()?),
+        Err(e) => Err(e).with_context(|| format!("is a node running with --api {api}?")),
+    }
 }
 
 fn post(api: &str, path: &str, body: serde_json::Value) -> Result<serde_json::Value> {

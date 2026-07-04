@@ -1,5 +1,52 @@
 # CHANGELOG
 
+## 0.4.0 — 2026-07-04 · Trust-gated economy, DHT, custody checks, phone UI
+
+**Mint security & trust (user-requested hardening)**
+- **Vouch revocation:** `Revoke` transaction; for each (voucher, vouchee)
+  pair the latest statement wins, and revoking cuts the whole subtree out
+  of your trust neighborhood. `revoke` CLI + `/revoke`.
+- **Mint blast-radius caps:** trusted views accept `mint_cap` — a limit on
+  how much total mint any single attester contributes (deterministic:
+  rewards considered in (timestamp, id) order). A rogue vouched wallet can
+  no longer inflate your view without bound.
+- **Trust-gated storage:** `--blob-trust-depth N` makes a provider refuse
+  storage requests from wallets outside its vouch neighborhood *at quote
+  time* (before any payment), and verify payments against its **trusted**
+  ledger view — coins minted outside the neighborhood buy nothing.
+  Verified live end to end, including the refusal paths.
+
+**Network protocols**
+- **Kademlia DHT** under `/timecoin/<net>/kad/1.0.0` (server mode on every
+  node): identify/mDNS feed the routing table, bootstrap runs on connect
+  and every 5 minutes. Peers-of-peers become dialable by id — verified
+  live: a node messaged another it had never connected to.
+
+**Storage custody (Stage 4 seed)**
+- At store time the client saves 4 random byte-range probes (hash of each
+  slice); `verify --peer --hash` (or `/verify/{hash}?peer=`) asks the
+  provider for one range and compares. A provider that deleted the blob
+  fails the check. Verified live both ways. (Spot-check, not a proof
+  system: no escrow/slashing yet — see ROADMAP Stage 4.)
+
+**Phone-friendly face**
+- The dashboard is now a mobile-first app: Home (trusted-first balances,
+  activity, peers), Act (thank/send/vouch/revoke/set-name forms with
+  name autocomplete), Chat (send + inbox), Join (**QR code** of the
+  community join file, rendered server-side at `/join-qr.svg`).
+- Inbox messages now carry the sender's wallet; names resolve everywhere.
+
+**Install & distribution**
+- `install.sh` (build + install to ~/.local/bin with quickstart).
+- GitHub Actions: CI (tests + clippy -D warnings) on every push; tagged
+  releases build Linux/macOS/Windows binaries automatically.
+
+**Fixes**
+- Custody probe generation panicked on blobs < 16 bytes.
+- Second genesis transaction was excluded from trusted views.
+- CLI `get` now surfaces the node's JSON error bodies like `post` does.
+
+
 ## 0.3.0 — 2026-07-03 · A network of people (ROADMAP Stage 3 core)
 
 - **Web of trust:** new `Vouch` transaction — a signed on-ledger statement

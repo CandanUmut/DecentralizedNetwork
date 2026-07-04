@@ -74,12 +74,19 @@ The MVP converges, but anyone can mint and a modified client can double-spend. F
   or community registrars.
 - **One-file community join** *(shipped)*: `timecoin-node join-file` emits
   `{network, bootstrap, relay}`; a friend runs `run --config that-file.json`.
-- **Rate limits & mint budgets** *(open problem, deliberately not faked)*: per-epoch
-  budgets need all nodes to agree which epoch a transaction belongs to, but DAG
-  timestamps are self-claimed — deterministic enforcement either needs anchored time
-  (checkpoint transactions) or acceptance windows that break convergence at the edges.
-  Design note kept here until there's an answer that doesn't cheat. In the meantime,
-  trusted views make untrusted mint-spam *ignorable* rather than preventable.
+- **Vouch revocation** *(shipped)*: latest statement per (voucher, vouchee) wins;
+  revoking cuts the subtree out of your neighborhood.
+- **Mint blast-radius caps** *(shipped, view-level)*: trusted views can cap any single
+  attester's total counted mint (`mint_cap`), deterministically. This bounds the damage
+  of a vouched wallet going rogue between its compromise and your revocation.
+- **Trust-gated services** *(shipped)*: storage providers can serve only their vouch
+  neighborhood and verify payments against their trusted ledger view.
+- **Rate limits & mint budgets over time** *(still open, deliberately not faked)*:
+  per-epoch budgets need all nodes to agree which epoch a transaction belongs to, but
+  DAG timestamps are self-claimed — deterministic enforcement either needs anchored
+  time (checkpoint transactions) or acceptance windows that break convergence at the
+  edges. The shipped mint caps bound *totals*, not *rates*; the time dimension is
+  recorded here until there's an answer that doesn't cheat.
 
 ## Stage 4 — the marketplace layer
 
@@ -87,6 +94,9 @@ The MVP converges, but anyone can mint and a modified client can double-spend. F
   random challenges (send me bytes i..j of H) prove continued custody; missed challenges
   slash escrowed payment. Escrow = 2-of-2 co-signed release transactions (the ledger
   already supports the primitive: a transfer signed but not yet published).
+  *Seed shipped:* clients save random byte-range probes at store time and can
+  spot-check custody later (`verify`); detection works, but consequences are still
+  social (revoke, stop paying) rather than economic (escrow/slashing).
 - **Compute jobs:** start with *deterministic, verifiable* jobs only — WASM tasks where
   the requester can re-execute a random sample, or N-of-M redundant execution with
   majority output. Non-verifiable AI inference comes only after reputation exists.
@@ -96,8 +106,10 @@ The MVP converges, but anyone can mint and a modified client can double-spend. F
 ## Stage 5 — reach
 
 Browser nodes via WebTransport/WebRTC (upstream libp2p supports both), mobile wrappers,
-a Kademlia DHT under our own protocol id once bootstrap lists stop scaling, IPFS interop
-for public content, audits before anything is called safe.
+IPFS interop for public content, audits before anything is called safe.
+*Pulled forward and shipped:* the Kademlia DHT under our own protocol id (peers-of-peers
+dialable by id), the phone-first web app with QR invites, install script, CI, and
+tagged-release binaries for Linux/macOS/Windows.
 
 ## What I would *not* do
 

@@ -27,6 +27,22 @@ vs. deferred: [SCOPE.md](SCOPE.md). How the old fork-based code was assessed and
 - Communities are isolated: `--network koop` has its own genesis, topics, and protocols —
   and joining one is a single `join-file` handed to a friend.
 
+## Install
+
+```bash
+git clone https://github.com/CandanUmut/DecentralizedNetwork
+cd DecentralizedNetwork && ./install.sh     # builds and installs to ~/.local/bin
+```
+
+Tagged releases also ship prebuilt Linux/macOS/Windows binaries via GitHub Actions
+(see the Releases page once a `v*` tag is pushed). Then:
+
+```bash
+timecoin-node run --data-dir ~/.timecoin
+# open http://127.0.0.1:3000 — the dashboard is phone-friendly:
+# Home (balances/activity) · Act (thank/send/vouch) · Chat · Join (QR invite)
+```
+
 ## Quickstart (one machine)
 
 ```bash
@@ -65,8 +81,12 @@ tc fetch --api 127.0.0.1:3002 --peer $NODE1 --hash <hash from store>
 # web of trust: set a name, vouch for people you know, view trusted balances
 tc name  --api 127.0.0.1:3001 --set umut
 tc vouch --api 127.0.0.1:3001 --to $NODE2
+tc revoke --api 127.0.0.1:3001 --to $NODE2   # people fall out; trust is revocable
 tc trust --api 127.0.0.1:3001
 tc balances --api 127.0.0.1:3001 --trusted   # only vouched-for minters count
+
+# spot-check that a provider still holds what you paid it to store
+tc verify --api 127.0.0.1:3002 --peer $NODE1 --hash <hash from store>
 
 # invite a friend: hand them one file
 tc join-file --api 127.0.0.1:3001 > my-community.json
@@ -166,27 +186,32 @@ inside the compose network for the demo).
 **Works (exercised in this repo, live, multi-node):**
 - Persistent peer identity; stable peer id + wallet + ledger across restarts.
 - Encrypted, authenticated transport (Noise / TLS 1.3, standard libp2p) over TCP and QUIC.
-- Discovery: mDNS locally (`--no-mdns` to disable), explicit bootstrap addresses remotely.
+- Discovery: mDNS locally (`--no-mdns` to disable), explicit bootstrap remotely, and a
+  **Kademlia DHT** under the community's own protocol id — peers-of-peers are dialable
+  by id (verified: a node messaged another it had never connected to).
 - Attested rewards (self-mint rejected), sequenced transfers, deterministic double-spend
   resolution and overdraft immunity (unit-tested; convergence verified across live nodes).
-- Delta sync on connect (tips + batched ancestry pulls) with orphan re-request.
-- Direct messages between connected peers, with peer addresses learned via identify.
-- Paid storage: quote → ledger payment (verified as *applied*, anti-double-redeem,
-  persisted across provider restarts) → store → fetch with local hash verification.
-- Relay fallback verified end to end (`scripts/relay-demo.sh`); one-command docker cluster.
+- Web of trust with **revocation**; trusted balance views with optional per-attester
+  **mint caps** (blast-radius limit for a rogue voucher).
+- **Trust-gated storage:** providers can refuse anyone outside their vouch neighborhood
+  (at quote time, before payment) and verify payments against their *trusted* ledger
+  view — rigged coin from outside buys nothing. Verified live, including refusal paths.
+- Custody **spot-checks**: store-time probes let you later verify a provider still holds
+  your blob (verified live: deletion is detected).
+- Direct messages, delta sync, relay fallback, one-command docker cluster, mobile-first
+  dashboard with QR invites.
 
 **Doesn't work / doesn't exist (on purpose, for now — see ROADMAP.md):**
-- **Sybil resistance is social, not cryptographic:** a stranger can still mint freely in
-  the *raw* view; the trusted view makes that money worthless to you, but services don't
-  consult trust yet when accepting payment, there's no vouch revocation, and no per-hop
-  trust decay. Keep networks private to people you trust.
-- **No proof of continued storage:** a paid provider could delete your blob later and
-  keep the payment; there's no challenge protocol or escrow yet (Stage 4). Also, if a
-  provider refuses after taking payment, the payment is not automatically refunded.
-- Messaging needs an existing connection (or a dialable/circuit address) — there's no
-  DHT-based peer lookup yet, and no store-and-forward for offline peers.
-- Full history still replicates to every node eventually; blobs are capped (512 KiB
-  default) by the wire codec's limits.
+- **Sybil resistance is social, not cryptographic.** Trusted views + trust-gated
+  services + mint caps make rigged coin useless *inside* a well-kept neighborhood, but
+  nothing stops strangers from minting in the raw view, and a vouched wallet that goes
+  rogue can still act within its cap until revoked. Keep networks private to people you
+  trust; vouch deliberately.
+- **Custody checks are spot-checks, not proofs:** a failed check tells you to stop
+  trusting a provider; it doesn't refund you (no escrow/slashing yet — Stage 4). A
+  payment burned on a refused Put after a passed quote is also not auto-refunded.
+- No store-and-forward messaging for offline peers.
+- Full history still replicates to every node; blobs capped (512 KiB default).
 - **Not audited.** Don't put anything valuable on it.
 
 ## Repo layout
