@@ -11,9 +11,12 @@ other to store data. No company, no server, no ads. **Read [VISION.md](VISION.md
 the why** — built on upstream [libp2p](https://libp2p.io) 0.56, no forked libraries.
 
 This is the deliberately small, honest core of a larger vision (shared compute, storage,
-simulations, safe comms + earning). Where it's going: [docs/ROADMAP.md](docs/ROADMAP.md).
-How this project was revived from its original code — and that code itself — lives in
-[docs/history/](docs/history/) and in git history at commit `2192a1b` (tagged `legacy-source` locally).
+simulations, safe comms + earning). **How it all works under the hood — the DAG, the
+libp2p networking, discovery without servers, the security model, the future compute
+design: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).** Where it's going:
+[docs/ROADMAP.md](docs/ROADMAP.md). How this project was revived from its original code
+— and that code itself — lives in [docs/history/](docs/history/) and in git history at
+commit `2192a1b` (tagged `legacy-source` locally).
 
 ## The ledger rules (30 seconds)
 
