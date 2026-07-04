@@ -32,7 +32,7 @@ cargo run -- run --data-dir /tmp/b --port 9002 --api 127.0.0.1:3002 --invite off
 | `src/main.rs` | CLI and node startup. |
 | `src/dashboard.html`, `src/invite.html` | The web UI, embedded via `include_str!`. Self-contained, no build step, no external assets. |
 | `docs/ROADMAP.md` | Where this is going, and the honestly-open problems. |
-| `docs/history/` | How this came to be (assessment of the original code, scope decisions, original notes). The pre-rewrite source is at git tag `legacy-source`. |
+| `docs/history/` | How this came to be (assessment of the original code, scope decisions, original notes). The pre-rewrite source is in git history at commit `2192a1b` (tagged `legacy-source` locally). |
 
 ## Ground rules
 

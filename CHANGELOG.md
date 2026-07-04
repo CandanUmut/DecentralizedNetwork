@@ -11,7 +11,7 @@ their way:
 - `docs/history/` — how this came to be: the Phase-0 `ASSESSMENT`, the
   revival `SCOPE`, and the author's original planning notes.
 - The unbuildable pre-rewrite source (`legacy/`) is removed from the working
-  tree; it remains fully browsable at the git tag **`legacy-source`**.
+  tree; it remains fully browsable in git history at commit `2192a1b` (tagged `legacy-source` locally).
 - New `CONTRIBUTING.md` (build/test/demo, code map, ground rules — never
   fake; determinism in the ledger is sacred) and `.github/SECURITY.md`
   (private vulnerability reporting; divergence bugs are highest severity).

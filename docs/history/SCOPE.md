@@ -6,7 +6,7 @@
 > blob storage, and direct messaging — plus the web of trust and the
 > daily-allowance economy. See [../ROADMAP.md](../ROADMAP.md) for the current
 > state and the repo-root CHANGELOG.md for what changed. The `legacy/` source
-> mentioned below lives at the git tag **`legacy-source`**.
+> mentioned below lives in git history at commit `2192a1b` (tagged `legacy-source` locally).
 
 This MVP exists to prove one thing end to end: **N nodes on current upstream libp2p
 discover each other, gossip signed TimeCoin contribution records into a shared DAG, and

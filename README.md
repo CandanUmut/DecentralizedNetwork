@@ -13,7 +13,7 @@ the why** — built on upstream [libp2p](https://libp2p.io) 0.56, no forked libr
 This is the deliberately small, honest core of a larger vision (shared compute, storage,
 simulations, safe comms + earning). Where it's going: [docs/ROADMAP.md](docs/ROADMAP.md).
 How this project was revived from its original code — and that code itself — lives in
-[docs/history/](docs/history/) and at the git tag `legacy-source`.
+[docs/history/](docs/history/) and in git history at commit `2192a1b` (tagged `legacy-source` locally).
 
 ## The ledger rules (30 seconds)
 
@@ -245,7 +245,7 @@ scripts/         runnable demos (relay fallback)
 docs/ROADMAP.md  the staged path from here to the full vision, open problems included
 docs/history/    how this came to be: assessment of the original code, scope
                  decisions, the author's original notes (pre-rewrite source
-                 itself is at git tag `legacy-source`)
+                 itself is in git history at commit `2192a1b` (tagged `legacy-source` locally))
 VISION.md        why this exists — start here if you're new
 CONTRIBUTING.md  build/test/demo instructions and the ground rules
 CHANGELOG.md     what changed and why, release by release
