@@ -254,6 +254,20 @@ CONTRIBUTING.md  build/test/demo instructions and the ground rules
 CHANGELOG.md     what changed and why, release by release
 ```
 
+## Troubleshooting
+
+- **"rejected transaction … unknown genesis / orphan pool full" floods** — an old-version
+  node (leftover process, docker container, or another machine on your LAN with an old
+  data dir) is talking to you. Since v0.5.2 incompatible versions can't exchange
+  transactions at all; to clean your machine: `pkill timecoin-node`,
+  `docker compose down`, delete old `--data-dir` directories, rebuild, start fresh.
+- **Upgrading across versions that changed ledger rules** (see CHANGELOG "breaking"
+  notes): all members must upgrade together and start fresh data dirs — the economy
+  rules are part of the network's identity, so old and new rules are different networks
+  by design.
+- **Two nodes on one machine** — give each its own `--data-dir`, `--port`, `--api`, and
+  either distinct `--invite` ports or `--invite off`.
+
 ## Contributing
 
 PRs welcome — read [CONTRIBUTING.md](CONTRIBUTING.md) first (two-minute read: how to

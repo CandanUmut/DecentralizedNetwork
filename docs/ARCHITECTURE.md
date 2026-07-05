@@ -298,9 +298,9 @@ When node A dials node B (`SwarmBuilder` config in `network.rs::Network::new`):
  │     many independent "streams" (like lanes)          │
  │  4. per stream, multistream-select negotiates WHICH  │
  │     protocol the lane speaks:                        │
- │       lane 1: /timecoin/main/sync/1.1.0              │
+ │       lane 1: /timecoin/main/<fp>/sync/2.0.0         │
  │       lane 2: /meshsub/1.1.0        (gossipsub)      │
- │       lane 3: /timecoin/main/msg/1.0.0               │
+ │       lane 3: /timecoin/main/<fp>/msg/1.0.0          │
  │       lane 4: /ipfs/ping/1.0.0                       │
 ```
 
@@ -318,9 +318,9 @@ for:
 
 | Behaviour | Protocol id | Job |
 |---|---|---|
-| **gossipsub** | `/meshsub/1.1.0`, topic `timecoin/<net>/tx/v2` | epidemic broadcast of new transactions (5.4) |
-| **request-response ×3** | `/timecoin/<net>/{sync,msg,blob}/…` | DAG sync, direct messages, storage — CBOR-encoded request/reply over a fresh stream |
-| **kad** (Kademlia) | `/timecoin/<net>/kad/1.0.0` | the DHT: find peers by id without any directory (6.2) |
+| **gossipsub** | `/meshsub/1.1.0`, topic `timecoin/<net>/<fp>/tx/v3` | epidemic broadcast of new transactions (5.4) |
+| **request-response ×3** | `/timecoin/<net>/<fp>/{sync,msg,blob}/…` | DAG sync, direct messages, storage — CBOR-encoded request/reply over a fresh stream |
+| **kad** (Kademlia) | `/timecoin/<net>/<fp>/kad/1.0.0` | the DHT: find peers by id without any directory (6.2) |
 | **mdns** | (UDP multicast) | zero-config discovery on the local network |
 | **identify** | `/ipfs/id/1.0.0` | peers exchange their addresses + your address *as they see it* (feeds NAT logic & the DHT) |
 | **ping** | `/ipfs/ping/1.0.0` | liveness + RTT |
@@ -329,9 +329,12 @@ for:
 | **dcutr** | `/libp2p/dcutr` | upgrade relayed connections to direct ones by hole punching (6.3) |
 | **upnp** | (router protocol) | ask your home router to open the port automatically |
 
-Note the naming: every protocol we defined is namespaced by community
-(`/timecoin/koop/sync/1.1.0`). Two communities' nodes that accidentally meet don't even
-share a protocol — isolation by construction, not by filtering.
+Note the naming: every protocol we defined is namespaced by community name **and a
+fingerprint of the community's rules** (`<fp>` = first 8 hex of genesis-1's id, e.g.
+`/timecoin/koop/a3f91c2e/sync/2.0.0`). Two communities' nodes — or two *versions* with
+different transaction rules — that accidentally meet don't even share a protocol:
+isolation by construction, not by filtering. On top of that, a peer that still manages
+to send repeatedly-invalid transactions collects strikes and is disconnected after 20.
 
 ### 5.4 gossipsub in thirty seconds
 
