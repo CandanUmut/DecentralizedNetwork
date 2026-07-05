@@ -1,12 +1,14 @@
 //! The libp2p layer, entirely on upstream released crates (no fork).
 //!
-//! Protocols (all namespaced by `--network` so communities stay isolated):
-//! - gossipsub topic `timecoin/<net>/tx/v2` — new-transaction broadcast
-//! - `/timecoin/<net>/sync/1.1.0`  — DAG anti-entropy: tips on connect,
+//! Protocols are namespaced by `--network` AND a fingerprint of the
+//! community's rules (first 8 hex of genesis-1's id), so nodes with any rule
+//! or format difference are mutually invisible rather than mutually noisy:
+//! - gossipsub topic `timecoin/<net>/<fp>/tx/v3` — new-transaction broadcast
+//! - `/timecoin/<net>/<fp>/sync/2.0.0` — DAG anti-entropy: tips on connect,
 //!   missing ancestry pulled in batched rounds (delta sync)
-//! - `/timecoin/<net>/msg/1.0.0`   — direct text messages (free; transport is
-//!   already Noise-encrypted and peer-authenticated)
-//! - `/timecoin/<net>/blob/1.0.0`  — paid content-addressed storage:
+//! - `/timecoin/<net>/<fp>/msg/1.0.0`  — direct text messages (free; the
+//!   transport is already Noise-encrypted and peer-authenticated)
+//! - `/timecoin/<net>/<fp>/blob/1.0.0` — paid content-addressed storage:
 //!   quote → pay on the ledger → put(payment id) → get(hash)
 
 use crate::dag::{wallet_address, Dag, Transaction, TxKind};
@@ -175,11 +177,22 @@ pub struct Network {
     pending_blobs: HashMap<OutboundRequestId, oneshot::Sender<Result<BlobResponse>>>,
     /// Ledger transfer ids already redeemed for storage (anti double-redeem).
     used_payments: HashSet<String>,
+    /// Invalid-transaction strikes per peer; repeat offenders get dropped.
+    strikes: HashMap<PeerId, u32>,
 }
 
-fn proto(network: &str, suffix: &str) -> Result<StreamProtocol> {
-    StreamProtocol::try_from_owned(format!("/timecoin/{network}/{suffix}"))
+/// Protocols are scoped by network name AND a genesis-id fingerprint, so two
+/// nodes with *any* rule difference (version, allowance, network) don't even
+/// share a protocol — incompatible peers become mutually invisible instead of
+/// spamming each other with rejectable transactions.
+fn proto(network: &str, fingerprint: &str, suffix: &str) -> Result<StreamProtocol> {
+    StreamProtocol::try_from_owned(format!("/timecoin/{network}/{fingerprint}/{suffix}"))
         .map_err(|e| anyhow!("invalid protocol name: {e}"))
+}
+
+/// Short fingerprint of the community's rules: first 8 hex of genesis-1's id.
+fn rules_fingerprint(params: &crate::dag::Params) -> String {
+    crate::dag::genesis(params)[0].id[..8].to_string()
 }
 
 impl Network {
@@ -190,11 +203,15 @@ impl Network {
         commands: mpsc::Receiver<Command>,
         config: Config,
     ) -> Result<Self> {
-        let sync_proto = proto(&config.network, "sync/1.1.0")?;
-        let msg_proto = proto(&config.network, "msg/1.0.0")?;
-        let blob_proto = proto(&config.network, "blob/1.0.0")?;
-        let kad_proto = proto(&config.network, "kad/1.0.0")?;
-        let identify_proto = format!("/timecoin/{}/1.0.0", config.network);
+        let fingerprint = rules_fingerprint(&crate::dag::Params {
+            network: config.network.clone(),
+            daily_allowance: config.daily_allowance,
+        });
+        let sync_proto = proto(&config.network, &fingerprint, "sync/2.0.0")?;
+        let msg_proto = proto(&config.network, &fingerprint, "msg/1.0.0")?;
+        let blob_proto = proto(&config.network, &fingerprint, "blob/1.0.0")?;
+        let kad_proto = proto(&config.network, &fingerprint, "kad/1.0.0")?;
+        let identify_proto = format!("/timecoin/{}/{fingerprint}/1.0.0", config.network);
         let enable_mdns = config.enable_mdns;
 
         let swarm = libp2p::SwarmBuilder::with_existing_identity(keypair.clone())
@@ -279,7 +296,8 @@ impl Network {
             .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(120)))
             .build();
 
-        let topic = gossipsub::IdentTopic::new(format!("timecoin/{}/tx/v2", config.network));
+        let topic =
+            gossipsub::IdentTopic::new(format!("timecoin/{}/{fingerprint}/tx/v3", config.network));
         let wallet = wallet_address(&keypair.public().to_peer_id());
         let used_payments = load_used_payments(&config.data_dir);
         let mut network = Self {
@@ -297,6 +315,7 @@ impl Network {
             pending_msgs: HashMap::new(),
             pending_blobs: HashMap::new(),
             used_payments,
+            strikes: HashMap::new(),
         };
         network
             .swarm
@@ -444,24 +463,46 @@ impl Network {
     }
 
     /// Import transactions from the network; returns ids of missing parents
-    /// (orphans we should request from the source peer).
-    fn import_txs(&mut self, txs: Vec<Transaction>, source: &str) -> Vec<String> {
-        let mut dag = self.dag.lock().unwrap();
-        for tx in txs {
-            let id = tx.id.clone();
-            match dag.insert(tx, now()) {
-                Ok(accepted) if !accepted.is_empty() => {
-                    info!(
-                        "accepted {} transaction(s) from {source} (dag size {})",
-                        accepted.len(),
-                        dag.len()
-                    );
+    /// (orphans we should request from the source peer). Peers that keep
+    /// sending invalid transactions collect strikes and get disconnected —
+    /// with rule-scoped protocols that mostly means malicious same-version
+    /// peers, since incompatible versions can't reach this code at all.
+    fn import_txs(&mut self, txs: Vec<Transaction>, source: PeerId) -> Vec<String> {
+        const MAX_STRIKES: u32 = 20;
+        let missing = {
+            let mut dag = self.dag.lock().unwrap();
+            for tx in txs {
+                let id = tx.id.clone();
+                match dag.insert(tx, now()) {
+                    Ok(accepted) if !accepted.is_empty() => {
+                        info!(
+                            "accepted {} transaction(s) from {source} (dag size {})",
+                            accepted.len(),
+                            dag.len()
+                        );
+                    }
+                    Ok(_) => debug!("transaction {id} parked or already known"),
+                    Err(e) => {
+                        let strikes = self.strikes.entry(source).or_insert(0);
+                        *strikes += 1;
+                        // First few loudly, the rest quietly — one bad peer
+                        // shouldn't be able to flood the log.
+                        if *strikes <= 3 {
+                            warn!("rejected transaction {id} from {source}: {e}");
+                        } else {
+                            debug!("rejected transaction {id} from {source}: {e}");
+                        }
+                    }
                 }
-                Ok(_) => debug!("transaction {id} parked or already known"),
-                Err(e) => warn!("rejected transaction {id} from {source}: {e}"),
             }
+            dag.missing_parents()
+        };
+        if self.strikes.get(&source).copied().unwrap_or(0) >= MAX_STRIKES {
+            warn!("{source} sent {MAX_STRIKES}+ invalid transactions — disconnecting");
+            self.strikes.remove(&source);
+            let _ = self.swarm.disconnect_peer_id(source);
         }
-        dag.missing_parents()
+        missing
     }
 
     fn request_missing(&mut self, peer: PeerId, missing: Vec<String>) {
@@ -663,6 +704,7 @@ impl Network {
                 if num_established == 0 {
                     info!("disconnected from {peer_id}");
                     self.peers.lock().unwrap().remove(&peer_id);
+                    self.strikes.remove(&peer_id);
                 }
             }
             SwarmEvent::Behaviour(BehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
@@ -688,7 +730,7 @@ impl Network {
                 ..
             })) => match serde_json::from_slice::<Transaction>(&message.data) {
                 Ok(tx) => {
-                    let missing = self.import_txs(vec![tx], &propagation_source.to_string());
+                    let missing = self.import_txs(vec![tx], propagation_source);
                     self.request_missing(propagation_source, missing);
                 }
                 Err(e) => warn!("undecodable gossip message from {propagation_source}: {e}"),
@@ -703,7 +745,7 @@ impl Network {
                 }
                 request_response::Message::Response { response, .. } => {
                     let SyncResponse::Txs(txs) = response;
-                    let missing = self.import_txs(txs, &peer.to_string());
+                    let missing = self.import_txs(txs, peer);
                     self.request_missing(peer, missing);
                 }
             },

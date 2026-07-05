@@ -1,5 +1,31 @@
 # CHANGELOG
 
+## 0.5.2 — 2026-07-05 · Version isolation: incompatible peers become invisible
+
+Field report: a node from an earlier version (old data dir / old binary /
+leftover docker container) connected to a v0.5.0 node and flooded it with
+its incompatible history — hundreds of "rejected transaction" warnings,
+"unknown genesis", and eventually "orphan pool full", which could block
+legitimate orphans.
+
+- **Rule-scoped protocols:** every protocol id and the gossip topic now
+  embed a fingerprint of the community's rules (first 8 hex of genesis-1's
+  id): `/timecoin/<net>/<fp>/sync/2.0.0`, topic
+  `timecoin/<net>/<fp>/tx/v3`, etc. Nodes with *any* difference — version,
+  transaction format, daily allowance, network name — no longer share a
+  single protocol, so they exchange nothing instead of rejecting
+  everything. Verified live: same-rules nodes sync normally; a
+  different-rules node connected to the same bootstrap receives nothing
+  and produces zero warnings on either side.
+- **Strikes:** a peer that still delivers 20+ invalid transactions (only
+  possible from a malicious same-version peer now) is disconnected;
+  rejection logs go quiet after the third from the same peer. Strike
+  counts reset on disconnect.
+- Fix your own machine after upgrading: stop old processes/containers
+  (`pkill timecoin-node`, `docker compose down`) and start with a fresh
+  `--data-dir` — old data dirs hold old-genesis DAGs.
+
+
 ## 0.5.1 — 2026-07-04 · Open-source ready: repo restructure
 
 No code changes — a house-cleaning release so a first-time visitor can find
